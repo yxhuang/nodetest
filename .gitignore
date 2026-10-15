@@ -1,0 +1,16 @@
+# 本地交接文档（含个人路径与状态，不公开）
+HANDOFF.md
+.work-orders/
+
+# 运行产物与下载的内核
+results/
+.cache/
+mihomo*
+!mihomo*.py
+*.gz
+*.zip
+
+# Python
+__pycache__/
+*.pyc
+.venv/

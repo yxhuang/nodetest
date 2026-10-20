@@ -90,8 +90,8 @@ Other architectures require `--mihomo`. No system proxy settings are modified.
 The terminal and `summary.txt` have three parts: a conclusion (best node,
 alternatives, the best choice for Gemini, fast nodes that cannot use Gemini, and
 where the client's currently selected nodes rank), one overall ranking table
-(protocol, region, bandwidth, latency = mean of per-target cold TTFB medians,
-failure rate, Gemini, IP质量), and short plain-language notes. Bandwidth below the
+(protocol, region, bandwidth, latency shown as `cold/reused` = mean of per-target
+cold and reused-connection TTFB medians, failure rate, Gemini, IP质量), and short plain-language notes. Bandwidth below the
 threshold is marked `↓`. `--detail` appends the technical table: cold/reused
 median TTFB per target, cold p95, raw Gemini verdicts, IP quality organization and measurement notes.
 `raw.csv` uses UTF-8 with BOM and includes per-request HTTP status, appconnect,
@@ -181,6 +181,8 @@ congested link; use `--jobs 1` for a serial comparison.
 Nodes with >20% failed requests or any entirely failed target are eliminated.
 Others rank by reaching the bandwidth threshold (default 10 Mbps), then the
 mean of target cold TTFB medians, then pooled cold TTFB p95 (nearest rank).
+The reused-connection latency is displayed for reference only and does not
+affect ranking.
 The deep-test speed (32 MiB) determines qualification when available, otherwise
 the screening speed (8 MiB).
 Quick mode ranks on latency only. With no bandwidth-qualified candidate,

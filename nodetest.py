@@ -828,12 +828,13 @@ def rank_nodes(nodes, rows, targets, min_mbps, quick=False, regions=None, gemini
         speeds = {row['phase']: row['mbps'] for row in rows if row['node'] == name and row['phase'] in ('bw1', 'bw2') and row.get('mbps') is not None}
         speed = speeds.get('bw2', speeds.get('bw1'))
         mean = statistics.mean(medians[(target, 'cold')] for target in targets)
+        warm = statistics.mean(medians[(target, 'warm')] for target in targets)
         p95 = percentile(cold)
         region = region_name(name, (regions or {}).get(name, ''))
         ranked.append({'node': name, 'type': node_type, 'region': region, 'medians': medians,
                        'gemini': (gemini or {}).get(name),
                        'ipq': (ipq or {}).get(name),
-                       'mean': mean, 'p95': p95, 'failure_rate': rate, 'mbps': speed,
+                       'mean': mean, 'warm': warm, 'p95': p95, 'failure_rate': rate, 'mbps': speed,
                        'reasons': reasons, 'qualified': speed is not None and speed >= min_mbps})
     return sorted(ranked, key=lambda item: (bool(item['reasons']), False if quick else not item['qualified'], item['mean'], item['p95'], item['node']))
 
@@ -966,16 +967,16 @@ def make_summary(ranked, targets, skipped, before, after, quick, minimum,
             '%s → %s（%s）' % (group, display_name(now), '第 %d 名' % place[now] if now in place else '已淘汰')
             for group, now in current))
 
-    lines += ['', '【总排名】' + ('quick 模式未测带宽，按延迟从低到高排' if quick else
-                                 '先看带宽是否达到 %g Mbps，达标的排前面，同档按延迟从低到高' % minimum)]
-    headings = ['排名', '节点', '协议', '地区'] + ([] if quick else ['带宽Mbps']) + ['延迟ms', '失败率'] + (['Gemini'] if show_gemini else []) + (['IP质量'] if show_ipq else [])
+    lines += ['', '【总排名】' + ('quick 模式未测带宽，按新连接延迟从低到高排' if quick else
+                                 '先看带宽是否达到 %g Mbps，达标的排前面，同档按新连接延迟从低到高' % minimum)]
+    headings = ['排名', '节点', '协议', '地区'] + ([] if quick else ['带宽Mbps']) + ['延迟ms(新连接/复用)', '失败率'] + (['Gemini'] if show_gemini else []) + (['IP质量'] if show_ipq else [])
     eliminated = [item for item in ranked if item['reasons']]
     table = [headings + (['备注'] if eliminated else [])]
     for item in ranked:
         rank = '淘汰' if item['reasons'] else str(place[item['node']])
         bw = [] if quick else ['-' if item['reasons'] else mbps_text(item['mbps']) + ('' if item['qualified'] else ' ↓')]
         table.append([rank, display_name(item['node']), TYPE_NAMES.get(item['type'].lower(), item['type']), item['region']] +
-                     bw + [number(item['mean']), '%.0f%%' % (item['failure_rate'] * 100) if item['failure_rate'] else '0'] +
+                     bw + [number(item['mean']) + '/' + number(item.get('warm')), '%.0f%%' % (item['failure_rate'] * 100) if item['failure_rate'] else '0'] +
                      ([gemini_plain(item.get('gemini'))] if show_gemini else []) +
                      ([ipq_label(item.get('ipq'))] if show_ipq else []) +
                      ([plain_reasons(item['reasons'], targets)] if eliminated else []))
@@ -984,7 +985,9 @@ def make_summary(ranked, targets, skipped, before, after, quick, minimum,
     lines += ['', '【怎么看】']
     if not quick:
         lines.append('· 带宽：下载速度，越高越好；带 ↓ 的没达到 %g Mbps（或没测准）。只测一次，不同时段会有波动。' % minimum)
-    lines += ['· 延迟：打开一个新网页要等多久（%s 的平均），越低越好，1000 ms 以内算快。' % '、'.join(targets),
+    lines += ['· 延迟（%s 的平均，越低越好）：新连接 = 打开一个新网页要等多久，含连到节点、握手，1000 ms 以内算快；'
+              '复用 = 连接建好后再请求的等待，接近纯网络往返，持续对话、连续请求的体感更接近它。'
+              '排名和结论里的延迟都按新连接，因为它最能拉开节点差距。' % '、'.join(targets),
               '· 失败率：请求失败的比例；超过 20% 或某个网站完全打不开就淘汰。']
     if show_gemini:
         lines.append('· Gemini：按节点出口 IP 匿名检测；“被认作中国IP”是 Google 把这个出口定位到了中国，其他“不能用”是 Google 限制了这个 IP；'

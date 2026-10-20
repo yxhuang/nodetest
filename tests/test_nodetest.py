@@ -360,7 +360,8 @@ class RankingTests(unittest.TestCase):
 
     def test_ranking_table_is_plain(self):
         nodes = [('A', 'Tuic'), ('B', 'Http'), ('C', 'Socks5')]
-        rows = [row(name, kind=kind, ms=ms) for name, ms in (('A', 100), ('B', 300), ('C', 200)) for kind in ('cold', 'warm')]
+        rows = [row(name, kind=kind, ms=ms if kind == 'cold' else ms // 4)
+                for name, ms in (('A', 100), ('B', 300), ('C', 200)) for kind in ('cold', 'warm')]
         rows += [row('C', target='web', code=0) for _ in range(3)]
         rows += [row('A', phase='bw2', kind='bw', mbps=92.4), row('B', phase='bw1', kind='bw', mbps=9.62)]
         ranked = n.rank_nodes(nodes, rows, ['web'], 10)
@@ -368,9 +369,12 @@ class RankingTests(unittest.TestCase):
         table = text[text.index('【总排名】'):text.index('【怎么看】')].splitlines()
         self.assertTrue(table[1].startswith('排名  节点'))
         self.assertNotIn('Gemini', table[1])
-        self.assertRegex(table[2], r'^1\s+A\s+TUIC\s+\S+\s+92\s+100\s+0$')
-        self.assertRegex(table[3], r'^2\s+B\s+HTTP\s+\S+\s+9\.6 ↓\s+300\s+0$')
-        self.assertRegex(table[4], r'^淘汰\s+C\s+SOCKS5\s+\S+\s+-\s+200\s+60%\s+失败太多$')
+        self.assertIn('延迟ms(新连接/复用)', table[1])
+        self.assertIn('同档按新连接延迟从低到高', table[0])
+        self.assertRegex(table[2], r'^1\s+A\s+TUIC\s+\S+\s+92\s+100/25\s+0$')
+        self.assertRegex(table[3], r'^2\s+B\s+HTTP\s+\S+\s+9\.6 ↓\s+300/75\s+0$')
+        self.assertRegex(table[4], r'^淘汰\s+C\s+SOCKS5\s+\S+\s+-\s+200/50\s+60%\s+失败太多$')
+        self.assertIn('排名和结论里的延迟都按新连接', text)
         self.assertNotIn('冷/复用', text)
         self.assertIn('【技术明细】', n.make_summary(ranked, ['web'], [], {}, {}, False, 10, detail=True))
         self.assertIn('web冷/复用ms', n.make_summary(ranked, ['web'], [], {}, {}, False, 10, detail=True))

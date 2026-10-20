@@ -37,6 +37,10 @@ DEFAULT_TARGETS = [('google', 'https://www.google.com/generate_204'),
 TRACE_URL = 'https://www.cloudflare.com/cdn-cgi/trace'
 GEMINI_URL = 'https://gemini.google.com/app'
 GEMINI_MAX_BYTES = 4 * 1024 * 1024
+IPQ_SOURCES = [('ident', 'https://ident.me/json'),
+               ('ip-api', 'http://ip-api.com/json/?fields=status,isp,org,as,mobile,proxy,hosting'),
+               ('ipquery', 'https://api.ipquery.io/?format=json')]
+IPQ_MAX_BYTES = 16 * 1024
 BW_URL = 'https://speed.cloudflare.com/__down?bytes={}'
 GROUP_TYPES = {'selector', 'urltest', 'fallback', 'loadbalance', 'relay'}
 SKIP_TYPES = GROUP_TYPES | {'direct', 'reject', 'rejectdrop', 'pass', 'compatible'}
@@ -599,6 +603,95 @@ def gemini_check(port, timeout, runner=None):
     return {'status': status, 'country': country, 'reason': reason, 'sample': sample}
 
 
+def ipq_parse(source, data):
+    """Keep only classification fields, never the response's exit IP or raw body.
+
+    Missing/malformed flags cannot establish inferred residential. In particular,
+    ip-api's proxy flag is not evidence of abuse.
+    """
+    if not isinstance(data, dict):
+        return None
+    declared, hosting, mobile, tor, abuser, org = None, None, None, False, False, ''
+    if source == 'ident':
+        declared = {'isp': 'residential', 'business': 'business', 'education': 'business',
+                    'government': 'business', 'banking': 'business', 'hosting': 'hosting'}.get(
+                        data.get('type') if isinstance(data.get('type'), str) else '')
+        org = data.get('aso')
+    elif source == 'ip-api':
+        if data.get('status') != 'success':
+            return None
+        hosting, mobile = data.get('hosting'), data.get('mobile')
+        org = data.get('org') or data.get('isp')
+    elif source == 'ipquery':
+        risk, isp = data.get('risk'), data.get('isp')
+        if not isinstance(risk, dict):
+            return None
+        hosting, mobile = risk.get('is_datacenter'), risk.get('is_mobile')
+        tor, abuser = risk.get('is_tor') is True, risk.get('is_abuser') is True
+        org = isp.get('org') if isinstance(isp, dict) else ''
+    else:
+        return None
+    kind = 'hosting' if hosting is True or declared == 'hosting' else 'mobile' if mobile is True else declared
+    inferred = kind is None and hosting is False and mobile is False
+    return {'type': 'residential' if inferred else kind, 'inferred': inferred,
+            'is_tor': tor, 'is_abuser': abuser, 'org': org if isinstance(org, str) else ''}
+
+
+def ipq_merge(sources):
+    """Conservative merge rather than FlClash's first-response race."""
+    values = [sources[key] for key in ('ident', 'ipquery', 'ip-api') if sources.get(key)]
+    kind = next((kind for kind in ('hosting', 'mobile') if any(v['type'] == kind for v in values)), None)
+    declared = next((v['type'] for v in values if v['type'] and not v['inferred']), None)
+    kind = kind or declared or next((v['type'] for v in values if v['inferred']), None)
+    inferred = bool(kind and not any(v['type'] == kind and not v['inferred'] for v in values))
+    tor, abuser = (any(v[key] for v in values) for key in ('is_tor', 'is_abuser'))
+    org = next((sources[key]['org'] for key in ('ident', 'ip-api', 'ipquery')
+                if sources.get(key) and sources[key]['org'].strip()), '')
+    status = '风险' if tor or abuser else '普通' if kind == 'hosting' else '优秀' if kind else '未知'
+    return {'status': status, 'type': kind, 'inferred': inferred, 'is_tor': tor, 'is_abuser': abuser, 'org': org}
+
+
+def ipq_check(port, timeout, runner=None):
+    """Query all three sources through the node; retain only safe metadata/samples."""
+    sources, samples = {}, []
+    for source, url in IPQ_SOURCES:
+        if runner is not None:
+            runner.check()
+        validate_url(url)
+        command = curl_args(port, timeout) + ['--max-filesize', str(IPQ_MAX_BYTES),
+                                              '--write-out', CURL_FORMAT, '--url', url]
+        sample = {'http_code': 0, 'appconnect_ms': 0, 'ttfb_ms': 0, 'total_ms': 0,
+                  'bytes': 0, 'exitcode': 28, 'connects': 0, 'note': 'IP质量源请求失败'}
+        parsed = None
+        try:
+            execute = runner.run if runner is not None else subprocess.run
+            result = execute(command, env=clean_env(), stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                             encoding='utf-8', errors='replace', timeout=timeout + 5)
+            body, _, tail = result.stdout.rpartition('\nNODETEST\t')
+            measured = parse_curl('NODETEST\t' + tail) if tail else []
+            if len(measured) == 1:
+                sample = measured[0]
+                if (result.returncode == 0 and sample['http_code'] == 200 and sample['exitcode'] == 0
+                        and len(body.encode('utf-8')) <= IPQ_MAX_BYTES):
+                    parsed = ipq_parse(source, json.loads(body))
+        except (subprocess.TimeoutExpired, OSError, ValueError, RecursionError, UserError):
+            # Never surface a body, JSON error or exception message containing an IP.
+            pass
+        if runner is not None:
+            runner.check()
+        sources[source] = parsed
+        sample['note'] = 'IP质量 ' + ipq_label(ipq_merge({source: parsed}))
+        samples.append((source, sample))
+    return dict(ipq_merge(sources), samples=samples)
+
+
+def ipq_label(check):
+    if not check:
+        return '未知'
+    kind = {'residential': '住宅', 'mobile': '移动', 'business': '商业', 'hosting': '机房'}.get(check.get('type'))
+    return check['status'] + ('·' + kind + ('?' if check.get('inferred') else '') if kind else '')
+
+
 def round_assignments(nodes, jobs, round_no):
     if not nodes:
         return [[] for _ in range(jobs)]
@@ -607,15 +700,16 @@ def round_assignments(nodes, jobs, round_no):
     return [ordered[index::jobs] for index in range(jobs)]
 
 
-def measure_latency(core, nodes, targets, rounds, timeout, record, regions, tty, gemini=None):
+def measure_latency(core, nodes, targets, rounds, timeout, record, regions, tty, gemini=None, ipq=None):
     """Workers own lanes; only the main thread records samples or prints progress.
 
     `gemini`, when a dict, receives each node's latest Gemini check; undetermined results
-    (未知, except the deterministic consent gate) are retried in later rounds like the country trace."""
+    (未知, except the deterministic consent gate) are retried in later rounds like the country trace.
+    `ipq` receives merged quality checks; only 未知 results are retried."""
     runner = CurlRunner()
     lanes = [(listener['proxy'], listener['port']) for listener in core.config['listeners']]
 
-    def worker(group, port, assigned, known_regions, known_gemini, messages):
+    def worker(group, port, assigned, known_regions, known_gemini, known_ipq, messages):
         try:
             for name, node_type in assigned:
                 runner.check()
@@ -632,7 +726,13 @@ def measure_latency(core, nodes, targets, rounds, timeout, record, regions, tty,
                 if known is not None and known.get('status') in (None, '未知') and not known.get('reason'):
                     runner.check()
                     check = gemini_check(port, timeout, runner=runner)
-                messages.put(('node', (name, node_type, samples, location, check)))
+                quality = None
+                known = known_ipq.get(name, {}) if known_ipq is not None else None
+                if known is not None and known.get('status') in (None, '未知'):
+                    runner.check()
+                    quality = ipq_check(port, timeout, runner=runner)
+                runner.check()
+                messages.put(('node', (name, node_type, samples, location, check, quality)))
         except BaseException as error:
             messages.put(('error', error))
         finally:
@@ -644,7 +744,8 @@ def measure_latency(core, nodes, targets, rounds, timeout, record, regions, tty,
             assignments = round_assignments(nodes, len(lanes), round_no)
             known_regions = dict(regions)
             known_gemini = dict(gemini) if gemini is not None else None
-            threads = [threading.Thread(target=worker, args=(group, port, assigned, known_regions, known_gemini, messages),
+            known_ipq = dict(ipq) if ipq is not None else None
+            threads = [threading.Thread(target=worker, args=(group, port, assigned, known_regions, known_gemini, known_ipq, messages),
                                         name='nodetest-' + group, daemon=True)
                        for (group, port), assigned in zip(lanes, assignments)]
             completed = finished = 0
@@ -658,13 +759,15 @@ def measure_latency(core, nodes, targets, rounds, timeout, record, regions, tty,
                     if kind == 'done':
                         finished += 1
                         continue
-                    name, node_type, samples, location, check = payload
+                    name, node_type, samples, location, check, quality = payload
                     for target, sample_kind, sample in samples:
                         record(name, node_type, 'latency', round_no, target, sample_kind, sample)
                     if location:
                         regions[name] = location
                     if check is not None:
                         gemini[name] = dict(check, round=round_no)
+                    if quality is not None:
+                        ipq[name] = dict(quality, round=round_no)
                     completed += 1
                     if tty:
                         print('\r延迟：第 %d/%d 轮，已完成 %d/%d 个节点' % (round_no, rounds, completed, len(nodes)), end='', flush=True)
@@ -704,7 +807,7 @@ def percentile(values, fraction=0.95):
     return ordered[max(0, math.ceil(len(ordered) * fraction) - 1)]
 
 
-def rank_nodes(nodes, rows, targets, min_mbps, quick=False, regions=None, gemini=None):
+def rank_nodes(nodes, rows, targets, min_mbps, quick=False, regions=None, gemini=None, ipq=None):
     ranked = []
     for name, node_type in nodes:
         latency = [row for row in rows if row['node'] == name and row['phase'] == 'latency']
@@ -729,6 +832,7 @@ def rank_nodes(nodes, rows, targets, min_mbps, quick=False, regions=None, gemini
         region = region_name(name, (regions or {}).get(name, ''))
         ranked.append({'node': name, 'type': node_type, 'region': region, 'medians': medians,
                        'gemini': (gemini or {}).get(name),
+                       'ipq': (ipq or {}).get(name),
                        'mean': mean, 'p95': p95, 'failure_rate': rate, 'mbps': speed,
                        'reasons': reasons, 'qualified': speed is not None and speed >= min_mbps})
     return sorted(ranked, key=lambda item: (bool(item['reasons']), False if quick else not item['qualified'], item['mean'], item['p95'], item['node']))
@@ -784,10 +888,12 @@ def render(table):
 
 
 def detail_table(ranked, targets, quick):
-    headings = ['节点', '类型', '地区', 'Gemini'] + [target + '冷/复用ms' for target in targets] + ['冷p95ms', '失败率', 'Mbps', '状态']
+    show_ipq = any(item.get('ipq') is not None for item in ranked)
+    headings = ['节点', '类型', '地区', 'Gemini'] + (['IP质量', '组织'] if show_ipq else []) + [target + '冷/复用ms' for target in targets] + ['冷p95ms', '失败率', 'Mbps', '状态']
     table = [headings]
     for item in ranked:
         table.append([display_name(item['node']), item['type'], item['region'], gemini_label(item.get('gemini'))] +
+                     ([ipq_label(item.get('ipq')), (item.get('ipq') or {}).get('org') or '-'] if show_ipq else []) +
                      [number(item['medians'][(target, 'cold')]) + '/' + number(item['medians'][(target, 'warm')]) for target in targets] +
                      [number(item['p95']), '%.1f%%' % (item['failure_rate'] * 100), number(item['mbps']),
                       '淘汰：' + '、'.join(item['reasons']) if item['reasons'] else ('延迟合格' if quick else '带宽达标' if item['qualified'] else '带宽未达标/未可信测得')])
@@ -802,6 +908,7 @@ def make_summary(ranked, targets, skipped, before, after, quick, minimum,
     """`selected` maps group -> ranked node name for groups whose current choice is a tested
     node, resolved by original identity; without it, display names are matched."""
     show_gemini = any(item.get('gemini') for item in ranked)
+    show_ipq = any(item.get('ipq') is not None for item in ranked)
     status = lambda item: (item.get('gemini') or {}).get('status')
     names = lambda items: '、'.join(display_name(item['node']) for item in items)
     eligible = [item for item in ranked if not item['reasons']]
@@ -844,6 +951,11 @@ def make_summary(ranked, targets, skipped, before, after, quick, minimum,
         pending = [item for item in recommended if (item.get('gemini') or {}).get('reason')]
         if pending:
             lines.append('Gemini 待核实（欧洲/英国节点，请在浏览器里试）：' + names(pending))
+    if show_ipq:
+        excellent = [item for item in recommended if (item.get('ipq') or {}).get('status') == '优秀']
+        if excellent:
+            lines.append('IP 质量优秀的候选：' + brief(excellent[0]) +
+                         ('；备选 ' + names(excellent[1:3]) if len(excellent) > 1 else ''))
     tested = {item['node'] for item in ranked}
     snapshot = after if after is not None else before
     if selected is None:
@@ -856,7 +968,7 @@ def make_summary(ranked, targets, skipped, before, after, quick, minimum,
 
     lines += ['', '【总排名】' + ('quick 模式未测带宽，按延迟从低到高排' if quick else
                                  '先看带宽是否达到 %g Mbps，达标的排前面，同档按延迟从低到高' % minimum)]
-    headings = ['排名', '节点', '协议', '地区'] + ([] if quick else ['带宽Mbps']) + ['延迟ms', '失败率'] + (['Gemini'] if show_gemini else [])
+    headings = ['排名', '节点', '协议', '地区'] + ([] if quick else ['带宽Mbps']) + ['延迟ms', '失败率'] + (['Gemini'] if show_gemini else []) + (['IP质量'] if show_ipq else [])
     eliminated = [item for item in ranked if item['reasons']]
     table = [headings + (['备注'] if eliminated else [])]
     for item in ranked:
@@ -865,6 +977,7 @@ def make_summary(ranked, targets, skipped, before, after, quick, minimum,
         table.append([rank, display_name(item['node']), TYPE_NAMES.get(item['type'].lower(), item['type']), item['region']] +
                      bw + [number(item['mean']), '%.0f%%' % (item['failure_rate'] * 100) if item['failure_rate'] else '0'] +
                      ([gemini_plain(item.get('gemini'))] if show_gemini else []) +
+                     ([ipq_label(item.get('ipq'))] if show_ipq else []) +
                      ([plain_reasons(item['reasons'], targets)] if eliminated else []))
     lines += render(table)
 
@@ -876,6 +989,9 @@ def make_summary(ranked, targets, skipped, before, after, quick, minimum,
     if show_gemini:
         lines.append('· Gemini：按节点出口 IP 匿名检测；“被认作中国IP”是 Google 把这个出口定位到了中国，其他“不能用”是 Google 限制了这个 IP；'
                      '“待核实”是欧洲/英国节点要先同意 cookie，没法匿名判断。是否能用不影响排名。')
+    if show_ipq:
+        lines.append('· IP质量：FlClash 同款判定口径，只看出口 IP 类型和 Tor/滥用标记，与速度无关；机房 IP 可能更常遇到验证码/风控。'
+                     '三源合并，任一源判机房即按机房；? 表示推断类型，未知会在下一轮重试。不影响排名。')
     lines.append('· 结果只代表这一次，换个时段再测更稳。要长期固定，在 FlClash 里手动选择的组（Selector）中直接选具体节点；自动测速组会自己换。')
     if skipped:
         lines.append('· 未测（子组或非节点成员）：' + '、'.join(skipped))
@@ -927,6 +1043,7 @@ def parser():
     p.add_argument('--target', action='append', metavar='名称=URL', help='重复指定以替换全部默认目标；禁止 Claude/Anthropic 主机')
     p.add_argument('--quick', action='store_true', help='只测延迟，跳过带宽')
     p.add_argument('--no-gemini', action='store_true', help='跳过每节点一次的 Gemini 可用性检测')
+    p.add_argument('--no-ipq', action='store_true', help='跳过每节点一次的 IP 质量检测')
     p.add_argument('--detail', action='store_true', help='报告末尾附分网站冷/复用延迟、p95 等技术明细')
     p.add_argument('--limit-rate', help='带宽测试 curl 限速，例如 2M')
     p.add_argument('--min-mbps', type=float, default=10, help='推荐带宽门槛（默认 10 Mbps）')
@@ -1016,11 +1133,14 @@ def run(args):
     before = selections(client.get('/proxies')['proxies'])
     rows, regions = [], {}
     gemini = None if args.no_gemini else {}
+    ipq = None if args.no_ipq else {}
     # Use opaque internal names for joining, redact only at the reporting boundary.
     target_names = [name for name, _ in targets]
     print('测试 %d 个节点，%d 轮 × %d 个目标，延迟 %d 个 worker 并行、带宽串行；所有客户端访问均为 GET。' % (len(nodes), args.rounds, len(targets), args.jobs))
     if gemini is not None:
         print('每个节点另做一次匿名 Gemini 可用性检测（约 150 KiB 压缩页面；未判定的下一轮重试，--no-gemini 跳过）。')
+    if ipq is not None:
+        print('每个节点另做一次匿名 IP 质量检测（三个小 JSON 请求；未知的下一轮重试，--no-ipq 跳过）。')
     if not args.quick:
         print('预计最大下载载荷：%d MiB（节点数 × 8 + min(3, 节点数) × 32）；另有延迟/trace/协议开销。' % (len(nodes) * 8 + min(3, len(nodes)) * 32))
     tty = sys.stdout.isatty()
@@ -1042,13 +1162,18 @@ def run(args):
             missing = [name for name, _ in nodes if name not in core.available]
             if missing:
                 raise UserError('私有 provider 缺少 %d 个待测节点；请检查配置是否使用内联 proxies。' % len(missing))
-            measure_latency(core, nodes, targets, args.rounds, args.timeout, record, regions, tty, gemini)
+            measure_latency(core, nodes, targets, args.rounds, args.timeout, record, regions, tty, gemini, ipq)
             for name, node_type in nodes:
                 if gemini is not None and name in gemini:
                     check = gemini[name]
                     sample = dict(check['sample'])
                     sample['note'] = ('；'.join(filter(None, ['Gemini ' + gemini_label(check), sample['note']])))
                     record(name, node_type, 'gemini', check['round'], 'gemini', 'check', sample)
+                if ipq is not None and name in ipq:
+                    check = ipq[name]
+                    for source_name, measured in check['samples']:
+                        sample = dict(measured, note=measured['note'] + '；合并 ' + ipq_label(check))
+                        record(name, node_type, 'ipq', check['round'], source_name, 'check', sample)
             port = core.config['listeners'][0]['port']
             if not args.quick:
                 candidates = [item for item in rank_nodes(nodes, rows, target_names, args.min_mbps, regions=regions) if not item['reasons']]
@@ -1093,7 +1218,9 @@ def run(args):
     ranking = rank_nodes(public_nodes, rows, clean_targets, args.min_mbps, args.quick,
                          # Infer from the original name before it is replaced for display.
                          {mapping[name]: regions.get(name) or region_name(name) for name, _ in nodes},
-                         {mapping[name]: check for name, check in gemini.items()} if gemini is not None else None)
+                         {mapping[name]: check for name, check in gemini.items()} if gemini is not None else None,
+                         {mapping[name]: dict(check, org=public(check['org'])) for name, check in ipq.items()}
+                         if ipq is not None else None)
     summary = make_summary(ranking, clean_targets, [public_name(name) for name in skipped],
                            # Snapshot keys are always group names (selections() keeps groups only).
                            {public(k): snapshot_name(v) for k, v in before.items()},

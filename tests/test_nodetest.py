@@ -35,6 +35,19 @@ def row(node='A', target='web', kind='cold', code=200, ms=100, phase='latency', 
                 phase=phase, mbps=mbps, time='2026-01-01T00:00:00', round=1, node_type='Http')
 
 
+def ipq_sample():
+    return dict(n.ipq_merge({'ident': n.ipq_parse('ident', {'type': 'hosting', 'aso': 'Synthetic Network'})}),
+                samples=[(source, dict(sample(), note='IP质量 普通·机房')) for source, _ in n.IPQ_SOURCES])
+
+
+class MockIPQTests(unittest.TestCase):
+    def setUp(self):
+        # Every run() workflow is isolated from the new default-on network check.
+        patcher = mock.patch.object(n, 'ipq_check', side_effect=lambda *a, **kw: ipq_sample())
+        self.ipq_mock = patcher.start()
+        self.addCleanup(patcher.stop)
+
+
 def fake_socket_factory():
     """No sockets even on hosts whose sandbox permits local networking."""
     counter = iter(range(40000, 41000))
@@ -516,7 +529,243 @@ class GeminiTests(unittest.TestCase):
         self.assertIn('要用 Gemini：就用 A\n', n.make_summary(ranked, ['web'], [], {}, {}, False, 10))
 
 
-class WorkflowTests(unittest.TestCase):
+class IPQualityTests(unittest.TestCase):
+    @staticmethod
+    def response(data, code=200, exitcode=0, returncode=None):
+        body = json.dumps(data) if not isinstance(data, str) else data
+        tail = '\nNODETEST\t%d\t0.1\t0.2\t0.3\t1000\t%d\t1\n' % (code, exitcode)
+        return subprocess.CompletedProcess([], exitcode if returncode is None else returncode, body + tail, None)
+
+    def test_ipq_source_parsing_and_grades(self):
+        for declared, expected in [('isp', '优秀·住宅'), ('business', '优秀·商业'),
+                                   ('education', '优秀·商业'), ('government', '优秀·商业'),
+                                   ('banking', '优秀·商业'), ('hosting', '普通·机房'), ('other', '未知')]:
+            with self.subTest(declared=declared):
+                parsed = n.ipq_parse('ident', {'type': declared, 'aso': 'Example ISP', 'asn': 64500,
+                                               'ip': '203.0.113.7'})
+                self.assertEqual(n.ipq_label(n.ipq_merge({'ident': parsed})), expected)
+                self.assertEqual(parsed['org'], 'Example ISP')
+                self.assertNotIn('203.0.113.7', repr(parsed))
+        for source in ('ip-api', 'ipquery'):
+            for hosting, mobile, expected in [(True, True, '普通·机房'), (False, True, '优秀·移动'),
+                                               (False, False, '优秀·住宅?'), (None, None, '未知')]:
+                data = ({'status': 'success', 'hosting': hosting, 'mobile': mobile, 'org': 'Network'}
+                        if source == 'ip-api' else {'risk': {'is_datacenter': hosting, 'is_mobile': mobile},
+                                                   'isp': {'org': 'Network'}})
+                parsed = n.ipq_parse(source, data)
+                self.assertEqual(n.ipq_label(n.ipq_merge({source: parsed})), expected)
+                self.assertEqual(parsed['org'], 'Network')
+        self.assertIsNone(n.ipq_parse('ip-api', {'status': 'fail', 'hosting': True}))
+        for source in ('ident', 'ip-api', 'ipquery'):
+            for invalid in (None, [], 'bad', 123):
+                self.assertIsNone(n.ipq_parse(source, invalid))
+        self.assertIsNone(n.ipq_parse('ipquery', {'risk': []}))
+        self.assertIsNone(n.ipq_parse('unknown', {}))
+        self.assertEqual(n.ipq_label(n.ipq_merge({'ident': n.ipq_parse('ident', {'type': []})})), '未知')
+        self.assertEqual(n.ipq_label(n.ipq_merge({'ip-api': n.ipq_parse('ip-api',
+                         {'status': 'success', 'hosting': 'false', 'mobile': 'false'})})), '未知')
+
+    def test_ipq_tor_abuser_and_proxy_flag(self):
+        for flag in ('is_tor', 'is_abuser'):
+            risk = {'is_datacenter': True, 'is_mobile': False, flag: True}
+            parsed = n.ipq_parse('ipquery', {'risk': risk})
+            check = n.ipq_merge({'ident': n.ipq_parse('ident', {'type': 'business'}), 'ipquery': parsed})
+            self.assertEqual(n.ipq_label(check), '风险·机房')
+            self.assertTrue(check['is_tor' if flag == 'is_tor' else 'is_abuser'])
+            risk['is_datacenter'] = None
+            self.assertEqual(n.ipq_label(n.ipq_merge({'ipquery': n.ipq_parse('ipquery', {'risk': risk})})), '风险')
+        data = {'status': 'success', 'proxy': True, 'hosting': False, 'mobile': False}
+        self.assertEqual(n.ipq_label(n.ipq_merge({'ip-api': n.ipq_parse('ip-api', data)})), '优秀·住宅?')
+        parsed = n.ipq_parse('ipquery', {'risk': {'is_datacenter': False, 'is_mobile': True,
+                                                'is_tor': 'false', 'is_abuser': 'true'}})
+        self.assertEqual(n.ipq_label(n.ipq_merge({'ipquery': parsed})), '优秀·移动')
+
+    def test_ipq_merge_precedence_and_fallbacks(self):
+        ident = n.ipq_parse('ident', {'type': 'business', 'aso': 'First'})
+        api = n.ipq_parse('ip-api', {'status': 'success', 'hosting': True, 'mobile': False, 'org': 'Second'})
+        query = n.ipq_parse('ipquery', {'risk': {'is_datacenter': False, 'is_mobile': True}, 'isp': {'org': 'Third'}})
+        sources = {'ident': ident, 'ip-api': api, 'ipquery': query}
+        check = n.ipq_merge(sources)
+        self.assertEqual((n.ipq_label(check), check['org']), ('普通·机房', 'First'))
+        sources['ip-api'] = None
+        self.assertEqual(n.ipq_label(n.ipq_merge(sources)), '优秀·移动')
+        sources['ipquery'] = n.ipq_parse('ipquery', {'risk': {'is_datacenter': False, 'is_mobile': False}})
+        self.assertEqual(n.ipq_label(n.ipq_merge(sources)), '优秀·商业')
+        sources['ident'] = None
+        self.assertEqual(n.ipq_label(n.ipq_merge(sources)), '优秀·住宅?')
+        sources['ipquery'] = None
+        self.assertEqual(n.ipq_label(n.ipq_merge(sources)), '未知')
+        # Declared ordering is independent of source dict insertion order.
+        sources = {'ip-api': dict(ident, type='residential', org='Second'),
+                   'ipquery': dict(ident, type='business', org='Third'),
+                   'ident': dict(ident, type='residential', org='First')}
+        self.assertEqual(n.ipq_merge(sources)['type'], 'residential')
+        sources.pop('ident')
+        self.assertEqual((n.ipq_merge(sources)['type'], n.ipq_merge(sources)['org']), ('business', 'Second'))
+        sources.pop('ip-api')
+        self.assertEqual(n.ipq_merge(sources)['org'], 'Third')
+        for first_org in ('', '  '):
+            self.assertEqual(n.ipq_merge({'ident': dict(ident, org=first_org), 'ip-api': api, 'ipquery': query})['org'], 'Second')
+
+    def test_ipq_curl_safety_and_privacy(self):
+        responses = [self.response({'ip': '203.0.113.7', 'type': 'business', 'aso': 'Linode'}),
+                     self.response({'query': '203.0.113.7', 'status': 'success', 'hosting': True, 'mobile': False}),
+                     self.response({'ip': '2001:db8::7', 'risk': {'is_datacenter': False, 'is_mobile': False}})]
+        with mock.patch.dict(os.environ, {'https_proxy': 'http://environment.invalid', 'ALL_PROXY': 'bad'}), \
+             mock.patch.object(n.subprocess, 'run', side_effect=responses) as run:
+            result = n.ipq_check(4000, 8)
+        self.assertEqual((n.ipq_label(result), result['org']), ('普通·机房', 'Linode'))
+        self.assertNotIn('203.0.113.7', repr(result))
+        self.assertNotIn('2001:db8::7', repr(result))
+        self.assertEqual(run.call_count, 3)
+        for call, (source, url) in zip(run.call_args_list, n.IPQ_SOURCES):
+            command, kwargs = call.args[0], call.kwargs
+            self.assertEqual(command[:2], ['curl', '-q'])
+            self.assertIn('http://127.0.0.1:4000', command)
+            self.assertIn('--globoff', command)
+            self.assertEqual(command[command.index('--max-redirs') + 1], '0')
+            self.assertEqual(command[command.index('--max-filesize') + 1], str(n.IPQ_MAX_BYTES))
+            self.assertEqual(command[-1], n.validate_url(url))
+            self.assertNotIn('--location', command)
+            self.assertNotIn('-L', command)
+            self.assertFalse(any('cookie' in value.lower() for value in command))
+            self.assertFalse(any(key.lower() in n.PROXY_ENV for key in kwargs['env']))
+            self.assertEqual(kwargs['stderr'], subprocess.DEVNULL)
+            self.assertEqual(kwargs['timeout'], 13)
+            self.assertEqual(kwargs['stdout'], subprocess.PIPE)
+
+    def test_ipq_http_json_and_transport_failures(self):
+        valid = {'type': 'hosting', 'aso': 'Linode'}
+        failures = [self.response(valid, code=429), self.response(valid, code=403),
+                    self.response(valid, code=302), self.response(valid, exitcode=28),
+                    self.response(valid, exitcode=18), self.response(valid, exitcode=63),
+                    self.response(valid, returncode=1), self.response('{bad json'),
+                    self.response([]), self.response({}), self.response('x' * (n.IPQ_MAX_BYTES + 1)),
+                    self.response('[' * 2000), subprocess.CompletedProcess([], 0, '203.0.113.7', None),
+                    subprocess.TimeoutExpired('curl', 8), OSError('203.0.113.7')]
+        for failure in failures:
+            with self.subTest(failure=type(failure).__name__), \
+                 mock.patch.object(n.subprocess, 'run', side_effect=[failure, self.response({'status': 'fail'}), self.response({})]) as run:
+                check = n.ipq_check(4000, 8)
+            self.assertEqual(check['status'], '未知')
+            self.assertEqual(run.call_count, 3)
+            self.assertNotIn('203.0.113.7', repr(check))
+        # A 429 at one source must not discard another source's evidence.
+        with mock.patch.object(n.subprocess, 'run', side_effect=[self.response(valid, code=429),
+                self.response({'status': 'success', 'hosting': False, 'mobile': True, 'org': 'Fallback'}),
+                self.response({}, code=429)]):
+            check = n.ipq_check(4000, 8)
+        self.assertEqual((n.ipq_label(check), check['org']), ('优秀·移动', 'Fallback'))
+        self.assertEqual(check['samples'][0][1]['http_code'], 429)
+
+    def test_ipq_runner_cancellation_between_sources(self):
+        runner = mock.Mock()
+        runner.run.return_value = self.response({'type': 'hosting'})
+        # Cancellation after the first request prevents spawning the next one.
+        runner.check.side_effect = [None, n.Interrupted()]
+        with mock.patch.object(n.subprocess, 'run', side_effect=AssertionError('must use runner')), \
+             self.assertRaises(n.Interrupted):
+            n.ipq_check(4000, 8, runner=runner)
+        runner.run.assert_called_once()
+        runner.check.side_effect = n.Interrupted()
+        runner.run.reset_mock()
+        with self.assertRaises(n.Interrupted):
+            n.ipq_check(4000, 8, runner=runner)
+        runner.run.assert_not_called()
+
+    def test_ipq_report_columns_candidates_and_hidden(self):
+        nodes = [('A', 'Http'), ('B', 'Http')]
+        rows = [row(), row(kind='warm'), row('B', ms=200), row('B', kind='warm', ms=200)]
+        quality = {'A': dict(ipq_sample(), status='优秀', type='residential', inferred=True, org='Example ISP'),
+                   'B': dict(ipq_sample(), status='未知', type=None)}
+        summary = lambda checks: n.make_summary(n.rank_nodes(nodes, rows, ['web'], 10, True, ipq=checks),
+                                                ['web'], [], {}, {}, True, 10, detail=True)
+        text = summary(quality)
+        self.assertIn('IP质量', text)
+        self.assertIn('优秀·住宅?', text)
+        self.assertIn('未知', text)
+        self.assertIn('Example ISP', text)
+        self.assertIn('IP 质量优秀的候选：A', text)
+        self.assertIn('Tor/滥用', text)
+        self.assertIn('与速度无关', text)
+        self.assertIn('验证码/风控', text)
+        hidden = summary(None)
+        for value in ('IP质量', 'IP 质量', '组织', 'Tor/滥用'):
+            self.assertNotIn(value, hidden)
+        self.assertNotIn('IP 质量优秀的候选', summary({'A': ipq_sample(), 'B': ipq_sample()}))
+
+    def test_ipq_csv_rows_do_not_affect_rankings(self):
+        nodes = [('A', 'Http'), ('B', 'Http')]
+        rows = [row(), row(kind='warm'), row(phase='bw1', kind='bw', mbps=20),
+                row('B', ms=200), row('B', kind='warm', ms=200), row('B', phase='bw2', kind='bw', mbps=30)]
+        extra = [row('A', phase='ipq', kind='check', code=0, ms=999999, mbps=9999),
+                 row('B', phase='ipq', kind='check', target='other', code=429)]
+        for quick in (False, True):
+            self.assertEqual(n.rank_nodes(nodes, rows, ['web'], 10, quick),
+                             n.rank_nodes(nodes, rows + extra, ['web'], 10, quick))
+        # The same isolation holds after a raw CSV round-trip for comparisons.
+        import csv
+        with tempfile.TemporaryDirectory() as directory:
+            _, path = n.write_results(directory, 'test', '', 'G', rows + extra, 'summary')
+            with path.open(encoding='utf-8-sig', newline='') as stream:
+                saved = list(csv.DictReader(stream))
+        for item in saved:
+            item['http_code'] = int(item['http_code'])
+            item['ttfb_ms'] = float(item['ttfb_ms'])
+            item['mbps'] = float(item['mbps']) if item['mbps'] else None
+        self.assertEqual(n.rank_nodes(nodes, rows, ['web'], 10), n.rank_nodes(nodes, saved, ['web'], 10))
+
+
+class WorkflowTests(MockIPQTests):
+    def test_ipq_workflow_privacy_and_no_ipq(self):
+        proxies = {'AI专用': {'type': 'Selector', 'all': ['TestNode'], 'now': 'TestNode'},
+                   'TestNode': {'type': 'Http'}}
+        client = mock.Mock()
+        client.get.side_effect = lambda path: {'all': ['TestNode']} if path != '/proxies' else {'proxies': proxies}
+        core = mock.MagicMock()
+        core.__enter__.return_value = core
+        core.available = {'TestNode'}
+        core.config = {'listeners': [{'proxy': 'T1', 'port': 54321}]}
+        parsed = n.ipq_parse('ident', {'ip': '203.0.113.7', 'type': 'business',
+            'aso': 'Linode synthetic-password 203.0.113.7 2001:db8::7'})
+        quality = dict(n.ipq_merge({'ident': parsed}), samples=ipq_sample()['samples'])
+        self.ipq_mock.side_effect = lambda *a, **kw: quality
+        for disabled in (False, True):
+            self.ipq_mock.reset_mock()
+            with self.subTest(disabled=disabled), tempfile.TemporaryDirectory() as directory:
+                config = Path(directory) / 'source.yaml'
+                config.write_text(SOURCE)
+                args = n.parser().parse_args(['--config', str(config), '--quick', '--rounds', '2',
+                    '--jobs', '1', '--no-gemini', '--detail', '--out', directory] + (['--no-ipq'] if disabled else []))
+                with mock.patch.object(n, 'ReadController', return_value=client), \
+                     mock.patch.object(n, 'ensure_core', return_value=Path('fake')), \
+                     mock.patch.object(n, 'PrivateCore', return_value=core), \
+                     mock.patch.object(n, 'check_curl'), \
+                     mock.patch.object(n, 'curl_measure', return_value=[sample(), sample(connects=0)]), \
+                     mock.patch.object(n, 'trace_location', return_value='JP'), \
+                     mock.patch.object(n, 'gemini_check') as gemini, \
+                     mock.patch.object(n.subprocess, 'run', side_effect=AssertionError('no network')), \
+                     contextlib.redirect_stdout(io.StringIO()) as output, \
+                     contextlib.redirect_stderr(io.StringIO()) as errors:
+                    n.run(args)
+                gemini.assert_not_called()
+                self.assertEqual(self.ipq_mock.call_count, 0 if disabled else 1)
+                texts = [output.getvalue(), errors.getvalue()] + [
+                    path.read_text(encoding='utf-8-sig') for path in Path(directory).glob('*-*.*') if path != config]
+                for text in texts:
+                    for secret in ('203.0.113.7', '2001:db8::7', 'synthetic-password'):
+                        self.assertNotIn(secret, text)
+                raw = next(Path(directory).glob('*-raw.csv')).read_text(encoding='utf-8-sig')
+                if disabled:
+                    self.assertNotIn(',ipq,', raw)
+                    for value in ('IP质量', 'IP 质量', '--no-ipq', 'Tor/滥用', '组织'):
+                        self.assertNotIn(value, output.getvalue())
+                else:
+                    self.assertEqual(raw.count(',ipq,'), 3)
+                    self.assertIn('优秀·商业', output.getvalue())
+                    self.assertIn('Linode [redacted] [ip] [ip]', output.getvalue())
+                    self.assertIn('匿名 IP 质量检测', output.getvalue())
+
     def test_full_bandwidth_workflow_and_interleaving(self):
         names = ['TestNode', 'OtherNode', 'ThirdNode', 'FourthNode', 'FailedNode']
         proxies = {name: {'type': 'Http'} for name in names}
@@ -752,7 +1001,46 @@ class WorkflowTests(unittest.TestCase):
             self.assertEqual(signal.getsignal(sig), original)
 
 
-class ParallelTests(unittest.TestCase):
+class ParallelTests(MockIPQTests):
+    def test_ipq_retries_unknown_and_main_thread_owns_results(self):
+        main_thread = threading.get_ident()
+        class MainDict(dict):
+            def __setitem__(inner, key, value):
+                self.assertEqual(threading.get_ident(), main_thread)
+                super().__setitem__(key, value)
+        quality, attempts, current = MainDict(), Counter(), {}
+        core = mock.Mock()
+        core.config = {'listeners': [{'proxy': 'T1', 'port': 40001}]}
+        core.select.side_effect = lambda name, group: current.__setitem__(group, name)
+        def check(port, timeout, runner=None):
+            self.assertNotEqual(threading.get_ident(), main_thread)
+            self.assertIsInstance(runner, n.CurlRunner)
+            runner.check()
+            name = current['T1']
+            attempts[name] += 1
+            status = '优秀' if name == 'A' or (name == 'B' and attempts[name] > 1) else '未知'
+            return dict(ipq_sample(), status=status)
+        self.ipq_mock.side_effect = check
+        with mock.patch.object(n, 'curl_measure', return_value=[sample(), sample()]), \
+             mock.patch.object(n, 'trace_location', return_value='US'), contextlib.redirect_stdout(io.StringIO()):
+            n.measure_latency(core, [('A', 'Http'), ('B', 'Http'), ('C', 'Http')], [('web', 'https://example.org/')],
+                              3, 8, lambda *args: None, {}, False, ipq=quality)
+        self.assertEqual(attempts, {'A': 1, 'B': 2, 'C': 3})
+        self.assertEqual({name: check['round'] for name, check in quality.items()}, {'A': 1, 'B': 2, 'C': 3})
+
+    def test_interruption_during_ipq_check_propagates(self):
+        core = mock.Mock()
+        core.config = {'listeners': [{'proxy': 'T1', 'port': 40001}]}
+        self.ipq_mock.side_effect = n.Interrupted()
+        with mock.patch.object(n, 'curl_measure', return_value=[sample(), sample()]), \
+             mock.patch.object(n, 'trace_location', return_value='US'), \
+             mock.patch.object(n.CurlRunner, 'cancel') as cancel, contextlib.redirect_stdout(io.StringIO()):
+            with self.assertRaises(n.Interrupted):
+                n.measure_latency(core, [('A', 'Http')], [('web', 'https://example.org/')],
+                                  2, 8, lambda *args: None, {}, False, ipq={})
+        self.ipq_mock.assert_called_once()
+        cancel.assert_called()
+
     def test_bandwidth_runs_on_first_lane_after_parallel_latency(self):
         names = ['A', 'B', 'C']
         proxies = {name: {'type': 'Http'} for name in names}

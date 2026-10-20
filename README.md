@@ -67,6 +67,7 @@ nodetest --group AI专用 --label home
 nodetest --quick --rounds 2
 nodetest --quick --rounds 1 --jobs 4
 nodetest --quick --no-gemini
+nodetest --quick --no-ipq
 nodetest --config /path/to/config.yaml --mihomo /path/to/mihomo
 nodetest --target google=https://www.google.com/generate_204 --timeout 8
 nodetest --limit-rate 2M --min-mbps 10 --out ./results
@@ -90,9 +91,9 @@ The terminal and `summary.txt` have three parts: a conclusion (best node,
 alternatives, the best choice for Gemini, fast nodes that cannot use Gemini, and
 where the client's currently selected nodes rank), one overall ranking table
 (protocol, region, bandwidth, latency = mean of per-target cold TTFB medians,
-failure rate, Gemini), and short plain-language notes. Bandwidth below the
+failure rate, Gemini, IP质量), and short plain-language notes. Bandwidth below the
 threshold is marked `↓`. `--detail` appends the technical table: cold/reused
-median TTFB per target, cold p95, raw Gemini verdicts and measurement notes.
+median TTFB per target, cold p95, raw Gemini verdicts, IP quality organization and measurement notes.
 `raw.csv` uses UTF-8 with BOM and includes per-request HTTP status, appconnect,
 TTFB, total duration, bytes, speed and failure/reconnection notes.
 Names are filename-sanitized; repeated runs in the same minute get a suffix.
@@ -129,10 +130,52 @@ also supports Gemini, and nodes that pass the speed bar but cannot use Gemini.
 change; verify 未知 results in a browser. The CSV stores one `phase=gemini`,
 `kind=check` row per node with the verdict in `note`.
 
-Measured on one machine with 23 nodes: one serial quick round took about
+Each node also gets an anonymous **IP quality** check through its private node
+port, using three small JSON requests (each response capped at 16 KiB):
+
+- `https://ident.me/json`: declared IP type and organization (`type`, `aso`).
+- `http://ip-api.com/json/?fields=status,isp,org,as,mobile,proxy,hosting`:
+  hosting/mobile flags and organization. The free API requires HTTP, so this
+  source has no TLS integrity protection.
+- `https://api.ipquery.io/?format=json`: `risk.is_datacenter`, `risk.is_mobile`,
+  `risk.is_tor`, optional `risk.is_abuser`, and `isp.org`.
+
+The grade follows FlClash's type/Tor/abuse rules: Tor or abuse means 风险;
+otherwise residential/mobile/business means 优秀, and hosting means 普通.
+ident.me's `isp` maps to residential; `business`, `education`, `government`
+and `banking` map to business; `hosting` maps to hosting. With both hosting
+and mobile explicitly false, ip-api/ipquery infer residential as a fallback.
+Examples: `优秀·住宅`, `优秀·移动`, `优秀·商业`, `普通·机房`, `风险·机房`;
+an inferred type gets `?` (e.g. `优秀·住宅?`). Missing usable evidence is 未知.
+The proxy flag alone is not an abuse marker; these sources may not supply abuse
+evidence, so absence of a risk mark is not a guarantee of a clean IP.
+
+**Intentional difference from FlClash:** FlClash races the first three sources
+and uses the first response. nodetest queries all three and merges: any hosting
+evidence wins, then any mobile evidence, then a declared type in
+ident.me → ipquery → ip-api order, then inferred residential. Tor/abuse flags
+are combined with OR; organization uses ident.me → ip-api → ipquery order.
+This avoids a hosting IP being graded 优秀 just because ident.me says business
+and replies first. Each request uses no cookies or redirects. Failed requests,
+non-200 responses (including 429), and malformed JSON do not override other
+sources; 未知 nodes retry all three in later rounds. Once classified, a node is
+not checked again during the run. Later FlClash source waves are not used.
+
+IP quality measures only exit type and risk flags, independently of speed;
+hosting IPs may encounter more CAPTCHAs or service risk controls. It does not
+eliminate or reorder nodes; the conclusion can name quality-excellent candidates
+among the speed/latency-qualified nodes. `--no-ipq` skips all three requests and
+hides the report column, candidates and explanation, including in `--detail`.
+The CSV stores three `phase=ipq`, `kind=check` rows per node from its latest
+attempt, with source verdicts and the merged verdict in `note`. These rows do
+not affect latency, failure rate, bandwidth or ranking comparisons. Raw JSON
+and exit IP fields are discarded; organization text uses the existing report
+redaction. Exit IPs are never written to reports, CSV, logs or terminal output.
+
+Before IP quality checks were added, measured on one machine with 23 nodes: one serial quick round took about
 5.5 minutes; the default run (3 rounds, 4 workers, plus bandwidth) took about
 6 minutes. Slow or failing nodes, shared network capacity and timeouts change
-this. Actual total elapsed time is printed at completion. Parallel latency probes can influence one another on a
+this; IP quality requests add time too. Actual total elapsed time is printed at completion. Parallel latency probes can influence one another on a
 congested link; use `--jobs 1` for a serial comparison.
 
 Nodes with >20% failed requests or any entirely failed target are eliminated.
@@ -153,8 +196,8 @@ node in an upper Selector group yourself.
 Bandwidth screening downloads at most 8 MiB / 5 s per eligible node; the three
 fastest trustworthy results get up to 32 MiB / 10 s each. The upper download
 payload estimate is printed before testing: `nodes × 8 + min(3, nodes) × 32` MiB.
-Latency responses, one small country-code trace and one Gemini page (about
-150 KiB compressed) per node, and protocol overhead
+Latency responses, one small country-code trace, one Gemini page (about
+150 KiB compressed), three small IP-quality JSON responses per node, and protocol overhead
 are additional. `--quick` skips bandwidth, and `--limit-rate` caps bandwidth
 requests. Timeouts retain partial download speed only with HTTP 200 and at least
 256 KiB, using bytes / (total - TTFB). Small files favor nodes that ramp up quickly.

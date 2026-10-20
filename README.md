@@ -66,6 +66,7 @@ nodetest --list-groups
 nodetest --group AI专用 --label home
 nodetest --quick --rounds 2
 nodetest --quick --rounds 1 --jobs 4
+nodetest --quick --no-gemini
 nodetest --config /path/to/config.yaml --mihomo /path/to/mihomo
 nodetest --target google=https://www.google.com/generate_204 --timeout 8
 nodetest --limit-rate 2M --min-mbps 10 --out ./results
@@ -106,6 +107,22 @@ Country trace requests retry in later rounds until a country code is obtained.
 Known codes and node-name inference use the same Chinese country names; unknown
 codes remain unchanged.
 
+Each node also gets one anonymous Gemini availability check: a GET of
+`https://gemini.google.com/app` (no cookies, no redirects, compressed, capped
+at 4 MiB) reads the per-IP availability flag and Google's country guess (ISO
+alpha-3) from the page. The `Gemini` column shows 可用 / 不可用 / 未知 with that
+country, e.g. `不可用(SGP)`. A supported country marked unavailable usually means
+Google restricts that exit IP; `CHN` means Google geolocates the exit to China.
+未知 (request failed, non-200, or the flag is missing after a page redesign) is
+retried in later rounds. EEA/UK exits get a cookie-consent gate whose flag is
+always false for anonymous visitors; these show `未知(…·需同意页)` and are not
+retried. Gemini results do not
+eliminate or reorder nodes; the summary instead lists recommended nodes that
+also support Gemini, and nodes that pass the speed bar but cannot use Gemini.
+`--no-gemini` skips the check. The flag is an undocumented page detail and may
+change; verify 未知 results in a browser. The CSV stores one `phase=gemini`,
+`kind=check` row per node with the verdict in `note`.
+
 Measured on one machine with 23 nodes: one serial quick round took about
 5.5 minutes; the default run (3 rounds, 4 workers, plus bandwidth) took about
 6 minutes. Slow or failing nodes, shared network capacity and timeouts change
@@ -130,7 +147,8 @@ node in an upper Selector group yourself.
 Bandwidth screening downloads at most 8 MiB / 5 s per eligible node; the three
 fastest trustworthy results get up to 32 MiB / 10 s each. The upper download
 payload estimate is printed before testing: `nodes × 8 + min(3, nodes) × 32` MiB.
-Latency responses, one small country-code trace per node, and protocol overhead
+Latency responses, one small country-code trace and one Gemini page (about
+150 KiB compressed) per node, and protocol overhead
 are additional. `--quick` skips bandwidth, and `--limit-rate` caps bandwidth
 requests. Timeouts retain partial download speed only with HTTP 200 and at least
 256 KiB, using bytes / (total - TTFB). Small files favor nodes that ramp up quickly.
@@ -141,7 +159,8 @@ dependency. This is a direct-member test: nested groups, DIRECT and REJECT are
 skipped. Private ports are selected dynamically; a bind race causes a clean
 startup failure. WSL networking/firewall restrictions can prevent UDP nodes from
 working; a failure is not proof the node itself is bad. The tool does not check
-account access or log in to any target service.
+account access or log in to any target service; the Gemini check reflects
+anonymous region/IP availability only.
 
 ## Tests
 

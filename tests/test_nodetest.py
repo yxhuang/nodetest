@@ -409,6 +409,65 @@ class OutputTests(unittest.TestCase):
         self.assertIn(b'NODETEST_DISTRO', data)
 
 
+class GeminiTests(unittest.TestCase):
+    def test_verdict_markers(self):
+        self.assertEqual(n.gemini_verdict('x,\\"45631641\\":false,y ,2,1,200,"SGP"'), ('不可用', 'SGP', ''))
+        self.assertEqual(n.gemini_verdict('{"45631641":true}'), ('可用', '', ''))
+        self.assertEqual(n.gemini_verdict('[45631641,null,true] ,2,1,200,"USA"'), ('可用', 'USA', ''))
+        self.assertEqual(n.gemini_verdict('<html>changed</html>'), ('未知', '', ''))
+        for body in ('[145631641,null,true]', '[45631641,null,trueValue]', '{"45631641":falsehood}', '{"x45631641":true}'):
+            self.assertEqual(n.gemini_verdict(body)[0], '未知', body)
+        consent = '"https://consent.google.com/save?continue" \\"45631641\\":false ,2,1,200,"FRA"'
+        self.assertEqual(n.gemini_verdict(consent), ('未知', 'FRA', '需同意页'))
+        self.assertEqual(n.gemini_label({'status': '未知', 'country': 'FRA', 'reason': '需同意页'}), '未知(FRA·需同意页)')
+
+    def test_check_parses_body_and_write_out(self):
+        body = 'a\\"45631641\\":true ,2,1,200,"JPN"'
+        tail = '\nNODETEST\t200\t0.1\t0.2\t0.3\t1000\t0\t1\n'
+        for code, expected in ((200, ('可用', 'JPN')), (403, ('未知', ''))):
+            done = subprocess.CompletedProcess([], 0, body + tail.replace('200', str(code), 1), None)
+            with mock.patch.object(n.subprocess, 'run', return_value=done) as run:
+                result = n.gemini_check(4000, 8)
+            self.assertEqual((result['status'], result['country']), expected)
+            command = run.call_args.args[0]
+            self.assertIn('--compressed', command)
+            self.assertEqual(command[-1], n.GEMINI_URL)
+            self.assertEqual(run.call_args.kwargs['env'], n.clean_env())
+
+    def test_incomplete_page_is_unknown(self):
+        body = 'a\\"45631641\\":false ,2,1,200,"SGP"'
+        for exitcode in (18, 28, 63):
+            tail = '\nNODETEST\t200\t0.1\t0.2\t0.3\t1000\t%d\t1\n' % exitcode
+            done = subprocess.CompletedProcess([], exitcode, body + tail, None)
+            with mock.patch.object(n.subprocess, 'run', return_value=done):
+                result = n.gemini_check(4000, 8)
+            self.assertEqual(result['status'], '未知')
+            self.assertEqual(result['sample']['exitcode'], exitcode)
+
+    def test_check_timeout_is_unknown(self):
+        with mock.patch.object(n.subprocess, 'run', side_effect=subprocess.TimeoutExpired('curl', 1)):
+            result = n.gemini_check(4000, 8)
+        self.assertEqual((result['status'], result['sample']['http_code']), ('未知', 0))
+
+    def test_summary_flags_fast_nodes_without_gemini(self):
+        rows = [row('A'), row('A', kind='warm'), row('B', ms=200), row('B', kind='warm')]
+        checks = {'A': {'status': '不可用', 'country': 'SGP'}, 'B': {'status': '可用', 'country': 'USA'}}
+        ranked = n.rank_nodes([('A', 'Http'), ('B', 'Http')], rows, ['web'], 10, True, {}, checks)
+        text = n.make_summary(ranked, ['web'], [], {}, {}, True, 10)
+        self.assertIn('建议长期固定（本次候选）：A（Gemini 不可用）、B', text)
+        self.assertIn('兼顾 Gemini 的候选：B', text)
+        self.assertIn('延迟合格但 Gemini 不可用：A', text)
+        self.assertIn('不可用(SGP)', text)
+        self.assertNotIn('Gemini', n.make_summary(n.rank_nodes([('A', 'Http')], rows, ['web'], 10, True), ['web'], [], {}, {}, True, 10))
+        # Full mode only reports bandwidth-qualified nodes.
+        rows += [row('A', phase='bw1', mbps=50), row('B', phase='bw1', mbps=2)]
+        ranked = n.rank_nodes([('A', 'Http'), ('B', 'Http')], rows, ['web'], 10, False, {}, checks)
+        text = n.make_summary(ranked, ['web'], [], {}, {}, False, 10)
+        self.assertIn('建议长期固定（本次候选）：A（Gemini 不可用）\n', text)
+        self.assertIn('兼顾 Gemini 的候选：无', text)
+        self.assertIn('带宽达标但 Gemini 不可用：A', text)
+
+
 class WorkflowTests(unittest.TestCase):
     def test_full_bandwidth_workflow_and_interleaving(self):
         names = ['TestNode', 'OtherNode', 'ThirdNode', 'FourthNode', 'FailedNode']
@@ -436,6 +495,7 @@ class WorkflowTests(unittest.TestCase):
                  mock.patch.object(n, 'check_curl'), \
                  mock.patch.object(n, 'curl_measure', side_effect=measure) as measurements, \
                  mock.patch.object(n, 'trace_location', return_value='JP'), \
+                 mock.patch.object(n, 'gemini_check', return_value={'status': '不可用', 'country': 'SGP', 'sample': sample()}), \
                  contextlib.redirect_stdout(io.StringIO()) as output:
                 n.run(args)
             selected = [call.args[0] for call in core.select.call_args_list]
@@ -493,6 +553,7 @@ class WorkflowTests(unittest.TestCase):
                  mock.patch.object(n, 'check_curl'), \
                  mock.patch.object(n, 'curl_measure', side_effect=lambda *a, **kw: [sample(), sample(connects=0)]) as measure, \
                  mock.patch.object(n, 'trace_location', return_value='JP'), \
+                 mock.patch.object(n, 'gemini_check', return_value={'status': '不可用', 'country': 'SGP', 'sample': sample()}), \
                  contextlib.redirect_stdout(io.StringIO()) as output:
                 n.run(args)
             self.assertEqual(measure.call_count, 6)
@@ -507,6 +568,33 @@ class WorkflowTests(unittest.TestCase):
                 self.assertIn(',latency,', text)
                 self.assertIn(',cold,', text)
             self.assertIn('延迟合格', output.getvalue())
+            self.assertIn('延迟合格但 Gemini 不可用：TestNode', output.getvalue())
+            self.assertIn('不可用(SGP)', output.getvalue())
+            self.assertEqual(text.count(',gemini,'), 2)
+
+    def test_no_gemini_skips_check_and_column(self):
+        proxies = {'AI专用': {'type': 'Selector', 'all': ['TestNode'], 'now': 'TestNode'}, 'TestNode': {'type': 'Http'}}
+        client = mock.Mock()
+        client.get.side_effect = lambda path: {'all': ['TestNode']} if path != '/proxies' else {'proxies': proxies}
+        core = mock.MagicMock()
+        core.__enter__.return_value = core
+        core.available = {'TestNode'}
+        core.config = {'listeners': [{'proxy': 'T1', 'port': 54321}]}
+        with tempfile.TemporaryDirectory() as directory:
+            config = Path(directory) / 'source.yaml'
+            config.write_text(SOURCE)
+            args = n.parser().parse_args(['--config', str(config), '--quick', '--rounds', '1', '--jobs', '1', '--no-gemini', '--out', directory])
+            with mock.patch.object(n, 'ReadController', return_value=client), \
+                 mock.patch.object(n, 'ensure_core', return_value=Path('fake')), \
+                 mock.patch.object(n, 'PrivateCore', return_value=core), \
+                 mock.patch.object(n, 'check_curl'), \
+                 mock.patch.object(n, 'curl_measure', side_effect=lambda *a, **kw: [sample(), sample(connects=0)]), \
+                 mock.patch.object(n, 'trace_location', return_value='JP'), \
+                 mock.patch.object(n, 'gemini_check') as check, \
+                 contextlib.redirect_stdout(io.StringIO()) as output:
+                n.run(args)
+            check.assert_not_called()
+            self.assertNotIn('Gemini', output.getvalue())
 
     def test_opaque_names_when_a_credential_is_unparseable(self):
         names = ['美国-abc12', 'Direct-abc12']
@@ -530,6 +618,7 @@ class WorkflowTests(unittest.TestCase):
                  mock.patch.object(n, 'check_curl'), \
                  mock.patch.object(n, 'curl_measure', side_effect=lambda *a, **kw: [sample(), sample(connects=0)]), \
                  mock.patch.object(n, 'trace_location', return_value=''), \
+                 mock.patch.object(n, 'gemini_check', return_value={'status': '不可用', 'country': 'SGP', 'sample': sample()}), \
                  contextlib.redirect_stdout(io.StringIO()) as output:
                 n.run(args)
             texts = [output.getvalue()] + [path.read_text(encoding='utf-8-sig') for path in Path(directory).glob('*-*.*') if path != config]
@@ -593,6 +682,7 @@ class ParallelTests(unittest.TestCase):
                  mock.patch.object(n, 'check_curl'), \
                  mock.patch.object(n, 'curl_measure', side_effect=measure), \
                  mock.patch.object(n, 'trace_location', return_value='JP'), \
+                 mock.patch.object(n, 'gemini_check', return_value={'status': '不可用', 'country': 'SGP', 'sample': sample()}), \
                  contextlib.redirect_stdout(io.StringIO()) as output:
                 n.run(args)
             self.assertEqual(Counter(latency_calls), {name: 6 for name in names})
@@ -703,8 +793,44 @@ class ParallelTests(unittest.TestCase):
         self.assertEqual(attempts, {'A': 2, 'B': 3})
         self.assertEqual(regions, {'A': 'US'})
 
+    def test_gemini_retries_only_undetermined(self):
+        core = mock.Mock()
+        core.config = {'listeners': [{'proxy': 'T1', 'port': 40001}]}
+        current, attempts, gemini = {}, Counter(), {}
+        core.select.side_effect = lambda name, group: current.__setitem__(group, name)
+        def check(port, timeout, **kwargs):
+            name = current['T1']
+            attempts[name] += 1
+            if name == 'C':
+                return {'status': '未知', 'country': 'FRA', 'reason': '需同意页', 'sample': sample()}
+            status = '可用' if name == 'A' else '不可用' if attempts[name] > 1 else '未知'
+            return {'status': status, 'country': 'USA', 'reason': '', 'sample': sample()}
+        with mock.patch.object(n, 'curl_measure', return_value=[sample(), sample()]), \
+             mock.patch.object(n, 'trace_location', return_value='US'), \
+             mock.patch.object(n, 'gemini_check', side_effect=check), contextlib.redirect_stdout(io.StringIO()):
+            n.measure_latency(core, [('A', 'Http'), ('B', 'Http'), ('C', 'Http')], [('web', 'https://example.org/')],
+                              3, 8, lambda *args: None, {}, False, gemini)
+        self.assertEqual(attempts, {'A': 1, 'B': 2, 'C': 1})
+        self.assertEqual({name: item['status'] for name, item in gemini.items()}, {'A': '可用', 'B': '不可用', 'C': '未知'})
+        self.assertEqual(gemini['B']['round'], 2)
+
+    def test_interruption_during_gemini_check_propagates(self):
+        core = mock.Mock()
+        core.config = {'listeners': [{'proxy': 'T1', 'port': 40001}]}
+        with mock.patch.object(n, 'curl_measure', return_value=[sample(), sample()]), \
+             mock.patch.object(n, 'trace_location', return_value='US'), \
+             mock.patch.object(n, 'gemini_check', side_effect=n.Interrupted()) as check, \
+             mock.patch.object(n.CurlRunner, 'cancel') as cancel, contextlib.redirect_stdout(io.StringIO()):
+            with self.assertRaises(n.Interrupted):
+                n.measure_latency(core, [('A', 'Http')], [('web', 'https://example.org/')],
+                                  2, 8, lambda *args: None, {}, False, {})
+        check.assert_called_once()
+        cancel.assert_called()
+
     def test_signals_reap_worker_curl_and_clean_private_directory(self):
-        for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
+        # stage 'gemini': latency/trace return at once, so the hung curl is the real gemini_check.
+        for stage, sig in [(stage, sig) for stage in ('latency', 'gemini')
+                           for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)]:
             processes, ready = [], threading.Event()
             lock = threading.Lock()
             communicating = [0]
@@ -733,6 +859,7 @@ class ParallelTests(unittest.TestCase):
                     return self.returncode
 
             def spawn(*args, **kwargs):
+                self.assertEqual(n.GEMINI_URL in args[0], stage == 'gemini')
                 process = FakeCurl()
                 processes.append(process)
                 return process
@@ -750,8 +877,14 @@ class ParallelTests(unittest.TestCase):
             runner = n.CurlRunner()
             def run(args):
                 try:
-                    n.measure_latency(core, [('A', 'Http'), ('B', 'Http')], [('web', 'https://example.org/')],
-                                      1, 8, lambda *args: None, {}, False)
+                    if stage == 'gemini':
+                        with mock.patch.object(n, 'curl_measure', return_value=[sample(), sample()]), \
+                             mock.patch.object(n, 'trace_location', return_value='US'):
+                            n.measure_latency(core, [('A', 'Http'), ('B', 'Http')], [('web', 'https://example.org/')],
+                                              1, 8, lambda *args: None, {}, False, {})
+                    else:
+                        n.measure_latency(core, [('A', 'Http'), ('B', 'Http')], [('web', 'https://example.org/')],
+                                          1, 8, lambda *args: None, {}, False)
                 finally:
                     core.close()
             try:

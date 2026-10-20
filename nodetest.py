@@ -35,6 +35,8 @@ DEFAULT_TARGETS = [('google', 'https://www.google.com/generate_204'),
                    ('cloudflare', 'https://cp.cloudflare.com/generate_204'),
                    ('chatgpt', 'https://chatgpt.com/')]
 TRACE_URL = 'https://www.cloudflare.com/cdn-cgi/trace'
+GEMINI_URL = 'https://gemini.google.com/app'
+GEMINI_MAX_BYTES = 4 * 1024 * 1024
 BW_URL = 'https://speed.cloudflare.com/__down?bytes={}'
 GROUP_TYPES = {'selector', 'urltest', 'fallback', 'loadbalance', 'relay'}
 SKIP_TYPES = GROUP_TYPES | {'direct', 'reject', 'rejectdrop', 'pass', 'compatible'}
@@ -564,6 +566,39 @@ def trace_location(port, timeout, runner=None):
         return ''
 
 
+def gemini_verdict(body):
+    # The anonymous app page carries Google's per-IP availability flag and its country guess.
+    flag = re.search(r'\\?"45631641\\?"\s*:\s*(true|false)(?![\w$])|(?<![\w$])45631641,null,(true|false)(?![\w$])', body)
+    country = re.search(r',2,1,200,"([A-Z]{3})"', body)
+    status = '未知' if not flag else '可用' if 'true' in (flag.group(1), flag.group(2)) else '不可用'
+    reason = ''
+    if status == '不可用' and 'consent.google.com/' in body:
+        # EEA/UK anonymous visitors get a cookie-consent gate; the flag stays false regardless.
+        status, reason = '未知', '需同意页'
+    return status, country.group(1) if country else '', reason
+
+
+def gemini_check(port, timeout, runner=None):
+    """Return Gemini availability for the current exit; status is 可用/不可用/未知."""
+    validate_url(GEMINI_URL)
+    command = curl_args(port, timeout) + ['--compressed', '--max-filesize', str(GEMINI_MAX_BYTES),
+                                          '--write-out', CURL_FORMAT, '--url', GEMINI_URL]
+    try:
+        execute = runner.run if runner is not None else subprocess.run
+        result = execute(command, env=clean_env(), stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                         encoding='utf-8', errors='replace', timeout=timeout + 5)
+        body, _, tail = result.stdout.rpartition('\nNODETEST\t')
+        samples = parse_curl('NODETEST\t' + tail) if tail else []
+    except subprocess.TimeoutExpired:
+        body, samples = '', []
+    sample = samples[0] if samples else {'http_code': 0, 'appconnect_ms': 0, 'ttfb_ms': 0, 'total_ms': 0,
+                                          'bytes': 0, 'exitcode': 28, 'connects': 0, 'note': 'curl进程超时'}
+    # A timed-out, oversized or incomplete page may lack the flag or the consent marker: never decide on it.
+    complete = sample['http_code'] == 200 and sample['exitcode'] == 0
+    status, country, reason = gemini_verdict(body) if complete else ('未知', '', '')
+    return {'status': status, 'country': country, 'reason': reason, 'sample': sample}
+
+
 def round_assignments(nodes, jobs, round_no):
     if not nodes:
         return [[] for _ in range(jobs)]
@@ -572,12 +607,15 @@ def round_assignments(nodes, jobs, round_no):
     return [ordered[index::jobs] for index in range(jobs)]
 
 
-def measure_latency(core, nodes, targets, rounds, timeout, record, regions, tty):
-    """Workers own lanes; only the main thread records samples or prints progress."""
+def measure_latency(core, nodes, targets, rounds, timeout, record, regions, tty, gemini=None):
+    """Workers own lanes; only the main thread records samples or prints progress.
+
+    `gemini`, when a dict, receives each node's latest Gemini check; undetermined results
+    (未知, except the deterministic consent gate) are retried in later rounds like the country trace."""
     runner = CurlRunner()
     lanes = [(listener['proxy'], listener['port']) for listener in core.config['listeners']]
 
-    def worker(group, port, assigned, known_regions, messages):
+    def worker(group, port, assigned, known_regions, known_gemini, messages):
         try:
             for name, node_type in assigned:
                 runner.check()
@@ -589,7 +627,12 @@ def measure_latency(core, nodes, targets, rounds, timeout, record, regions, tty)
                     samples.extend((target, kind, sample) for kind, sample in zip(('cold', 'warm'), pair))
                 runner.check()
                 location = known_regions.get(name) or trace_location(port, timeout, runner=runner)
-                messages.put(('node', (name, node_type, samples, location)))
+                check = None
+                known = known_gemini.get(name, {}) if known_gemini is not None else None
+                if known is not None and known.get('status') in (None, '未知') and not known.get('reason'):
+                    runner.check()
+                    check = gemini_check(port, timeout, runner=runner)
+                messages.put(('node', (name, node_type, samples, location, check)))
         except BaseException as error:
             messages.put(('error', error))
         finally:
@@ -600,7 +643,8 @@ def measure_latency(core, nodes, targets, rounds, timeout, record, regions, tty)
             messages = queue.Queue()
             assignments = round_assignments(nodes, len(lanes), round_no)
             known_regions = dict(regions)
-            threads = [threading.Thread(target=worker, args=(group, port, assigned, known_regions, messages),
+            known_gemini = dict(gemini) if gemini is not None else None
+            threads = [threading.Thread(target=worker, args=(group, port, assigned, known_regions, known_gemini, messages),
                                         name='nodetest-' + group, daemon=True)
                        for (group, port), assigned in zip(lanes, assignments)]
             completed = finished = 0
@@ -614,11 +658,13 @@ def measure_latency(core, nodes, targets, rounds, timeout, record, regions, tty)
                     if kind == 'done':
                         finished += 1
                         continue
-                    name, node_type, samples, location = payload
+                    name, node_type, samples, location, check = payload
                     for target, sample_kind, sample in samples:
                         record(name, node_type, 'latency', round_no, target, sample_kind, sample)
                     if location:
                         regions[name] = location
+                    if check is not None:
+                        gemini[name] = dict(check, round=round_no)
                     completed += 1
                     if tty:
                         print('\r延迟：第 %d/%d 轮，已完成 %d/%d 个节点' % (round_no, rounds, completed, len(nodes)), end='', flush=True)
@@ -658,7 +704,7 @@ def percentile(values, fraction=0.95):
     return ordered[max(0, math.ceil(len(ordered) * fraction) - 1)]
 
 
-def rank_nodes(nodes, rows, targets, min_mbps, quick=False, regions=None):
+def rank_nodes(nodes, rows, targets, min_mbps, quick=False, regions=None, gemini=None):
     ranked = []
     for name, node_type in nodes:
         latency = [row for row in rows if row['node'] == name and row['phase'] == 'latency']
@@ -682,6 +728,7 @@ def rank_nodes(nodes, rows, targets, min_mbps, quick=False, regions=None):
         p95 = percentile(cold)
         region = region_name(name, (regions or {}).get(name, ''))
         ranked.append({'node': name, 'type': node_type, 'region': region, 'medians': medians,
+                       'gemini': (gemini or {}).get(name),
                        'mean': mean, 'p95': p95, 'failure_rate': rate, 'mbps': speed,
                        'reasons': reasons, 'qualified': speed is not None and speed >= min_mbps})
     return sorted(ranked, key=lambda item: (bool(item['reasons']), False if quick else not item['qualified'], item['mean'], item['p95'], item['node']))
@@ -691,12 +738,21 @@ def number(value):
     return '-' if value is None or not math.isfinite(value) else '%.0f' % value
 
 
+def gemini_label(check):
+    if not check:
+        return '-'
+    detail = '·'.join(filter(None, [check.get('country'), check.get('reason')]))
+    return check['status'] + ('(%s)' % detail if detail else '')
+
+
 def make_summary(ranked, targets, skipped, before, after, quick, minimum,
                  changed_names=None):
-    headings = ['节点', '类型', '地区'] + [target + '冷/复用ms' for target in targets] + ['冷p95ms', '失败率', 'Mbps', '状态']
+    show_gemini = any(item.get('gemini') for item in ranked)
+    headings = ['节点', '类型', '地区'] + (['Gemini'] if show_gemini else []) + [target + '冷/复用ms' for target in targets] + ['冷p95ms', '失败率', 'Mbps', '状态']
     table = [headings]
     for item in ranked:
         table.append([display_name(item['node']), item['type'], item['region']] +
+                     ([gemini_label(item.get('gemini'))] if show_gemini else []) +
                      [number(item['medians'][(target, 'cold')]) + '/' + number(item['medians'][(target, 'warm')]) for target in targets] +
                      [number(item['p95']), '%.1f%%' % (item['failure_rate'] * 100), number(item['mbps']),
                       '淘汰：' + '、'.join(item['reasons']) if item['reasons'] else ('延迟合格' if quick else '带宽达标' if item['qualified'] else '带宽未达标/未可信测得')])
@@ -704,7 +760,14 @@ def make_summary(ranked, targets, skipped, before, after, quick, minimum,
     lines = ['  '.join(pad(value, sizes[i]) for i, value in enumerate(row)).rstrip() for row in table]
     eligible = [item for item in ranked if not item['reasons']]
     recommended = eligible if quick else [item for item in eligible if item['qualified']]
-    lines += ['', '建议长期固定（本次候选）：' + ('、'.join(display_name(item['node']) for item in recommended[:3]) or '无；本次没有满足延迟及带宽门槛的节点')]
+    no_gemini = lambda item: show_gemini and (item.get('gemini') or {}).get('status') == '不可用'
+    lines += ['', '建议长期固定（本次候选）：' + ('、'.join(display_name(item['node']) + ('（Gemini 不可用）' if no_gemini(item) else '')
+                                                    for item in recommended[:3]) or '无；本次没有满足延迟及带宽门槛的节点')]
+    if show_gemini:
+        usable = [item for item in recommended if (item.get('gemini') or {}).get('status') == '可用']
+        lines.append('兼顾 Gemini 的候选：' + ('、'.join(display_name(item['node']) for item in usable[:3]) or '无'))
+        lines.append(('延迟合格' if quick else '带宽达标') + '但 Gemini 不可用：' +
+                     ('、'.join(display_name(item['node']) for item in recommended if no_gemini(item)) or '无'))
     if quick:
         lines.append('quick 模式只按延迟推荐，带宽未验证。')
     else:
@@ -731,6 +794,11 @@ def make_summary(ranked, targets, skipped, before, after, quick, minimum,
               '地区优先使用 Cloudflare trace 的 loc（仅保存地区，不保存出口 IP），失败时从节点名推断。',
               '单次结果不代表长期稳定，建议不同时段复测。UDP 节点失败也可能来自 WSL/防火墙限制。',
               'URLTest 组的固定选择在节点失联时仍会自动换；要真正钉死，应在上层 Selector 组直接选具体节点。']
+    if show_gemini:
+        lines.append('Gemini 列：匿名请求 gemini.google.com/app（不登录、不带 cookie），读页面里 Google 按出口 IP 给的可用开关；'
+                     '括号内是 Google 判定的国家（ISO3），可与 Cloudflare 地区不同。国家受支持仍不可用，通常是出口 IP 被 Google 限制；'
+                     '“未知”表示请求失败、非 200 或页面改版找不到开关；“需同意页”是欧盟/英国等出口匿名访问先要同意 cookie，'
+                     '开关恒为 false，无法匿名判定，请在浏览器里核实。Gemini 结果不参与淘汰和排序。')
     return '\n'.join(lines) + '\n'
 
 
@@ -769,6 +837,7 @@ def parser():
                    help='延迟并发 worker 数（1–8，默认 4）；带宽始终串行')
     p.add_argument('--target', action='append', metavar='名称=URL', help='重复指定以替换全部默认目标；禁止 Claude/Anthropic 主机')
     p.add_argument('--quick', action='store_true', help='只测延迟，跳过带宽')
+    p.add_argument('--no-gemini', action='store_true', help='跳过每节点一次的 Gemini 可用性检测')
     p.add_argument('--limit-rate', help='带宽测试 curl 限速，例如 2M')
     p.add_argument('--min-mbps', type=float, default=10, help='推荐带宽门槛（默认 10 Mbps）')
     p.add_argument('--config', type=Path, help='Clash 内联 proxies 配置；默认自动寻找 FlClash 配置')
@@ -800,6 +869,7 @@ def run(args):
     for _, url in targets:
         validate_url(url)
     validate_url(TRACE_URL)
+    validate_url(GEMINI_URL)
     validate_url(BW_URL.format(8 * 1024 * 1024))
     config_path = args.config.expanduser() if args.config else find_config()
     if config_path is None:
@@ -855,9 +925,12 @@ def run(args):
     binary = ensure_core(args.mihomo)
     before = selections(client.get('/proxies')['proxies'])
     rows, regions = [], {}
+    gemini = None if args.no_gemini else {}
     # Use opaque internal names for joining, redact only at the reporting boundary.
     target_names = [name for name, _ in targets]
     print('测试 %d 个节点，%d 轮 × %d 个目标，延迟 %d 个 worker 并行、带宽串行；所有客户端访问均为 GET。' % (len(nodes), args.rounds, len(targets), args.jobs))
+    if gemini is not None:
+        print('每个节点另做一次匿名 Gemini 可用性检测（约 150 KiB 压缩页面；未判定的下一轮重试，--no-gemini 跳过）。')
     if not args.quick:
         print('预计最大下载载荷：%d MiB（节点数 × 8 + min(3, 节点数) × 32）；另有延迟/trace/协议开销。' % (len(nodes) * 8 + min(3, len(nodes)) * 32))
     tty = sys.stdout.isatty()
@@ -879,7 +952,13 @@ def run(args):
             missing = [name for name, _ in nodes if name not in core.available]
             if missing:
                 raise UserError('私有 provider 缺少 %d 个待测节点；请检查配置是否使用内联 proxies。' % len(missing))
-            measure_latency(core, nodes, targets, args.rounds, args.timeout, record, regions, tty)
+            measure_latency(core, nodes, targets, args.rounds, args.timeout, record, regions, tty, gemini)
+            for name, node_type in nodes:
+                if gemini is not None and name in gemini:
+                    check = gemini[name]
+                    sample = dict(check['sample'])
+                    sample['note'] = ('；'.join(filter(None, ['Gemini ' + gemini_label(check), sample['note']])))
+                    record(name, node_type, 'gemini', check['round'], 'gemini', 'check', sample)
             port = core.config['listeners'][0]['port']
             if not args.quick:
                 candidates = [item for item in rank_nodes(nodes, rows, target_names, args.min_mbps, regions=regions) if not item['reasons']]
@@ -920,7 +999,8 @@ def run(args):
         raise UserError('目标名称脱敏后重复；请使用不包含地址或凭据的唯一名称。')
     ranking = rank_nodes(public_nodes, rows, clean_targets, args.min_mbps, args.quick,
                          # Infer from the original name before it is replaced for display.
-                         {mapping[name]: regions.get(name) or region_name(name) for name, _ in nodes})
+                         {mapping[name]: regions.get(name) or region_name(name) for name, _ in nodes},
+                         {mapping[name]: check for name, check in gemini.items()} if gemini is not None else None)
     summary = make_summary(ranking, clean_targets, [public_name(name) for name in skipped],
                            # Snapshot keys are always group names (selections() keeps groups only).
                            {public(k): public_name(v) for k, v in before.items()},

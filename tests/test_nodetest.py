@@ -293,9 +293,8 @@ class RankingTests(unittest.TestCase):
         ranked = n.rank_nodes(nodes, rows, ['web'], 10, True, {'日本01': 'JP'})
         self.assertEqual([item['region'] for item in ranked], ['日本', '日本'])
         summary = n.make_summary(ranked, ['web'], [], {}, {}, True, 10)
-        best = next(line for line in summary.splitlines() if line.startswith('各地区最佳'))
-        self.assertEqual(best.count('日本='), 1)
-        self.assertNotIn('JP=', best)
+        self.assertNotIn('各地区', summary)
+        self.assertEqual(sum(' 日本 ' in line for line in summary.splitlines()), 2)
         self.assertTrue(all(line == line.rstrip() for line in summary.splitlines()))
 
     def test_elimination_and_bandwidth_priority(self):
@@ -333,9 +332,35 @@ class RankingTests(unittest.TestCase):
     def test_summary_no_unqualified_recommendation(self):
         ranked = n.rank_nodes([('A', 'Http')], [row(), row(kind='warm')], ['web'], 10)
         summary = n.make_summary(ranked, ['web'], ['DIRECT'], {'G': 'A'}, {'G': 'B'}, False, 10)
-        self.assertIn('无；本次没有', summary)
-        self.assertIn('发生变化', summary)
-        self.assertIn('本工具未切换客户端', summary)
+        self.assertIn('最推荐：无；本次没有带宽达到 10 Mbps 的节点', summary)
+        self.assertIn('测试前后选择不同：G', summary)
+        self.assertIn('只读不写', summary)
+        self.assertIn('未测（子组或非节点成员）：DIRECT', summary)
+        # The end snapshot wins; B is not a tested node, so no line.
+        self.assertNotIn('FlClash 现在选的', summary)
+        summary = n.make_summary(ranked, ['web'], [], {'G': 'B'}, {'G': 'A'}, False, 10)
+        self.assertIn('FlClash 现在选的：G → A（第 1 名）', summary)
+        summary = n.make_summary(ranked, ['web'], [], {'G': 'A'}, None, False, 10)
+        self.assertIn('FlClash 测试前选的：G → A（第 1 名）', summary)
+        failed = n.rank_nodes([('A', 'Http')], [row(code=0), row(kind='warm', code=0)], ['web'], 10)
+        self.assertIn('G → A（已淘汰）', n.make_summary(failed, ['web'], [], {'G': 'A'}, {'G': 'A'}, False, 10))
+
+    def test_ranking_table_is_plain(self):
+        nodes = [('A', 'Tuic'), ('B', 'Http'), ('C', 'Socks5')]
+        rows = [row(name, kind=kind, ms=ms) for name, ms in (('A', 100), ('B', 300), ('C', 200)) for kind in ('cold', 'warm')]
+        rows += [row('C', target='web', code=0) for _ in range(3)]
+        rows += [row('A', phase='bw2', kind='bw', mbps=92.4), row('B', phase='bw1', kind='bw', mbps=9.62)]
+        ranked = n.rank_nodes(nodes, rows, ['web'], 10)
+        text = n.make_summary(ranked, ['web'], [], {}, {}, False, 10)
+        table = text[text.index('【总排名】'):text.index('【怎么看】')].splitlines()
+        self.assertTrue(table[1].startswith('排名  节点'))
+        self.assertNotIn('Gemini', table[1])
+        self.assertRegex(table[2], r'^1\s+A\s+TUIC\s+\S+\s+92\s+100\s+0$')
+        self.assertRegex(table[3], r'^2\s+B\s+HTTP\s+\S+\s+9\.6 ↓\s+300\s+0$')
+        self.assertRegex(table[4], r'^淘汰\s+C\s+SOCKS5\s+\S+\s+-\s+200\s+60%\s+失败太多$')
+        self.assertNotIn('冷/复用', text)
+        self.assertIn('【技术明细】', n.make_summary(ranked, ['web'], [], {}, {}, False, 10, detail=True))
+        self.assertIn('web冷/复用ms', n.make_summary(ranked, ['web'], [], {}, {}, False, 10, detail=True))
 
 
 class OutputTests(unittest.TestCase):
@@ -454,18 +479,41 @@ class GeminiTests(unittest.TestCase):
         checks = {'A': {'status': '不可用', 'country': 'SGP'}, 'B': {'status': '可用', 'country': 'USA'}}
         ranked = n.rank_nodes([('A', 'Http'), ('B', 'Http')], rows, ['web'], 10, True, {}, checks)
         text = n.make_summary(ranked, ['web'], [], {}, {}, True, 10)
-        self.assertIn('建议长期固定（本次候选）：A（Gemini 不可用）、B', text)
-        self.assertIn('兼顾 Gemini 的候选：B', text)
-        self.assertIn('延迟合格但 Gemini 不可用：A', text)
-        self.assertIn('不可用(SGP)', text)
+        self.assertIn('最推荐：A（延迟 100 ms，Gemini 不能用）', text)
+        self.assertIn('要用 Gemini：B（延迟 200 ms，Gemini 能用）', text)
+        self.assertIn('延迟合格但用不了 Gemini：A', text)
+        quick = lambda: n.make_summary(n.rank_nodes([('A', 'Http'), ('B', 'Http')], rows, ['web'], 10, True, {}, checks),
+                                       ['web'], [], {}, {}, True, 10)
+        checks['B'] = {'status': '不可用', 'country': 'CHN'}
+        self.assertIn('不能用(被认作中国IP)', quick())
+        header = next(line for line in quick().splitlines() if line.startswith('排名'))
+        self.assertNotIn('带宽', header)
+        checks['B'] = {'status': '未知', 'country': 'FRA', 'reason': '需同意页'}
+        text = quick()
+        self.assertIn('Gemini 待核实（欧洲/英国节点，请在浏览器里试）：B', text)
+        self.assertIn('要用 Gemini：本次没有确认能用 Gemini 的节点', text)
+        checks['A'] = {'status': '未知', 'country': ''}
+        self.assertIn('要用 Gemini：本次没测出哪个节点能用 Gemini', quick())
+        checks['B'] = {'status': '不可用', 'country': 'SGP'}
+        self.assertIn('要用 Gemini：本次没有确认能用 Gemini 的节点', quick())
+        checks['A'] = {'status': '可用', 'country': 'USA'}
+        gone = [dict(row('A', code=0)), dict(row('A', kind='warm', code=0))] + rows[2:]
+        text = n.make_summary(n.rank_nodes([('A', 'Http'), ('B', 'Http')], gone, ['web'], 10, True, {}, checks),
+                              ['web'], [], {}, {}, True, 10)
+        self.assertIn('要用 Gemini：能用 Gemini 的节点本次都被淘汰了', text)
+        checks['A'] = {'status': '不可用', 'country': 'SGP'}
+        checks['B'] = {'status': '可用', 'country': 'USA'}
         self.assertNotIn('Gemini', n.make_summary(n.rank_nodes([('A', 'Http')], rows, ['web'], 10, True), ['web'], [], {}, {}, True, 10))
         # Full mode only reports bandwidth-qualified nodes.
         rows += [row('A', phase='bw1', mbps=50), row('B', phase='bw1', mbps=2)]
         ranked = n.rank_nodes([('A', 'Http'), ('B', 'Http')], rows, ['web'], 10, False, {}, checks)
         text = n.make_summary(ranked, ['web'], [], {}, {}, False, 10)
-        self.assertIn('建议长期固定（本次候选）：A（Gemini 不可用）\n', text)
-        self.assertIn('兼顾 Gemini 的候选：无', text)
-        self.assertIn('带宽达标但 Gemini 不可用：A', text)
+        self.assertIn('最推荐：A（50 Mbps，延迟 100 ms，Gemini 不能用）\n', text)
+        self.assertIn('要用 Gemini：没有带宽达标且能用的节点；退而求其次 B（带宽不足或没测准）', text)
+        self.assertIn('带宽达标但用不了 Gemini：A', text)
+        checks['A'] = {'status': '可用', 'country': 'USA'}
+        ranked = n.rank_nodes([('A', 'Http'), ('B', 'Http')], rows, ['web'], 10, False, {}, checks)
+        self.assertIn('要用 Gemini：就用 A\n', n.make_summary(ranked, ['web'], [], {}, {}, False, 10))
 
 
 class WorkflowTests(unittest.TestCase):
@@ -558,7 +606,8 @@ class WorkflowTests(unittest.TestCase):
                 n.run(args)
             self.assertEqual(measure.call_count, 6)
             self.assertEqual(core.select.call_count, 2)
-            self.assertIn('策略组 now 一致', output.getvalue())
+            self.assertIn('测试前后所有选择都没变', output.getvalue())
+            self.assertIn('FlClash 现在选的：AI专用 → TestNode（第 1 名）', output.getvalue())
             core.__exit__.assert_called_once()
             self.assertEqual(len(list(Path(directory).glob('*-raw.csv'))), 1)
             for path in Path(directory).glob('*-raw.csv'):
@@ -568,9 +617,72 @@ class WorkflowTests(unittest.TestCase):
                 self.assertIn(',latency,', text)
                 self.assertIn(',cold,', text)
             self.assertIn('延迟合格', output.getvalue())
-            self.assertIn('延迟合格但 Gemini 不可用：TestNode', output.getvalue())
-            self.assertIn('不可用(SGP)', output.getvalue())
+            self.assertIn('延迟合格但用不了 Gemini：TestNode', output.getvalue())
+            self.assertIn('不能用', output.getvalue())
+            self.assertIn('测试组 AI专用（1 个节点）', output.getvalue())
             self.assertEqual(text.count(',gemini,'), 2)
+
+    def test_current_selection_matches_duplicate_redacted_names(self):
+        names = ['a.example.com', 'b.example.com']
+        proxies = {name: {'type': 'Http'} for name in names}
+        proxies['AI专用'] = {'type': 'Selector', 'all': names, 'now': 'b.example.com'}
+        # An untested node redacting to the same text must not borrow a tested node's rank.
+        proxies['c.example.com'] = {'type': 'Http'}
+        proxies['Other'] = {'type': 'Selector', 'all': ['c.example.com'], 'now': 'c.example.com'}
+        client = mock.Mock()
+        client.get.side_effect = lambda path: {'all': names} if path != '/proxies' else {'proxies': proxies}
+        core = mock.MagicMock()
+        core.__enter__.return_value = core
+        core.available = set(names)
+        core.config = {'listeners': [{'proxy': 'T1', 'port': 54321}]}
+        with tempfile.TemporaryDirectory() as directory:
+            config = Path(directory) / 'source.yaml'
+            config.write_text(SOURCE)
+            args = n.parser().parse_args(['--config', str(config), '--quick', '--rounds', '1', '--jobs', '1', '--no-gemini', '--out', directory])
+            with mock.patch.object(n, 'ReadController', return_value=client), \
+                 mock.patch.object(n, 'ensure_core', return_value=Path('fake')), \
+                 mock.patch.object(n, 'PrivateCore', return_value=core), \
+                 mock.patch.object(n, 'check_curl'), \
+                 mock.patch.object(n, 'curl_measure', side_effect=lambda *a, **kw: [sample(), sample(connects=0)]), \
+                 mock.patch.object(n, 'trace_location', return_value='US'), \
+                 contextlib.redirect_stdout(io.StringIO()) as output:
+                n.run(args)
+        self.assertIn('[host] [1]', output.getvalue())
+        self.assertRegex(output.getvalue(), r'FlClash 现在选的：AI专用 → \[host\] \[2\]（第 \d 名）')
+        self.assertNotIn('example.com', output.getvalue())
+        self.assertNotIn('Other →', output.getvalue())
+
+    def test_untested_node_with_same_redacted_name_gets_no_rank(self):
+        proxies = {'a.example.com': {'type': 'Http'}, 'b.example.com': {'type': 'Http'},
+                   'AI专用': {'type': 'Selector', 'all': ['a.example.com'], 'now': 'a.example.com'},
+                   'Other': {'type': 'Selector', 'all': ['b.example.com'], 'now': 'b.example.com'}}
+        client = mock.Mock()
+        client.get.side_effect = lambda path: {'all': ['a.example.com']} if path != '/proxies' else {'proxies': proxies}
+        core = mock.MagicMock()
+        core.__enter__.return_value = core
+        core.available = {'a.example.com'}
+        core.config = {'listeners': [{'proxy': 'T1', 'port': 54321}]}
+        with tempfile.TemporaryDirectory() as directory:
+            config = Path(directory) / 'source.yaml'
+            config.write_text(SOURCE)
+            args = n.parser().parse_args(['--config', str(config), '--quick', '--rounds', '1', '--jobs', '1', '--no-gemini', '--out', directory])
+            with mock.patch.object(n, 'ReadController', return_value=client), \
+                 mock.patch.object(n, 'ensure_core', return_value=Path('fake')), \
+                 mock.patch.object(n, 'PrivateCore', return_value=core), \
+                 mock.patch.object(n, 'check_curl'), \
+                 mock.patch.object(n, 'curl_measure', side_effect=lambda *a, **kw: [sample(), sample(connects=0)]), \
+                 mock.patch.object(n, 'trace_location', return_value='US'), \
+                 contextlib.redirect_stdout(io.StringIO()) as output:
+                n.run(args)
+        self.assertIn('FlClash 现在选的：AI专用 → [host]（第 1 名）\n', output.getvalue())
+        self.assertNotIn('Other →', output.getvalue())
+
+    def test_selected_uses_identity_not_display_name(self):
+        rows = [row('X'), row('X', kind='warm'), row('X（未测）', ms=200), row('X（未测）', kind='warm', ms=200)]
+        ranked = n.rank_nodes([('X', 'Http'), ('X（未测）', 'Http')], rows, ['web'], 10, True)
+        snap = {'G': 'X', 'Other': 'X（未测）'}
+        text = n.make_summary(ranked, ['web'], [], snap, snap, True, 10, selected={'G': 'X'})
+        self.assertIn('FlClash 现在选的：G → X（第 1 名）\n', text)
 
     def test_no_gemini_skips_check_and_column(self):
         proxies = {'AI专用': {'type': 'Selector', 'all': ['TestNode'], 'now': 'TestNode'}, 'TestNode': {'type': 'Http'}}

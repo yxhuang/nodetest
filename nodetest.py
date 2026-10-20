@@ -738,6 +738,12 @@ def number(value):
     return '-' if value is None or not math.isfinite(value) else '%.0f' % value
 
 
+GEMINI_PLAIN = {'可用': '能用', '不可用': '不能用', '未知': '未知'}
+TYPE_NAMES = {'http': 'HTTP', 'socks5': 'SOCKS5', 'tuic': 'TUIC', 'hysteria2': 'Hysteria2',
+              'hysteria': 'Hysteria', 'vless': 'VLESS', 'vmess': 'VMess', 'trojan': 'Trojan',
+              'shadowsocks': 'SS', 'ss': 'SS', 'wireguard': 'WireGuard', 'anytls': 'AnyTLS'}
+
+
 def gemini_label(check):
     if not check:
         return '-'
@@ -745,60 +751,143 @@ def gemini_label(check):
     return check['status'] + ('(%s)' % detail if detail else '')
 
 
-def make_summary(ranked, targets, skipped, before, after, quick, minimum,
-                 changed_names=None):
-    show_gemini = any(item.get('gemini') for item in ranked)
-    headings = ['节点', '类型', '地区'] + (['Gemini'] if show_gemini else []) + [target + '冷/复用ms' for target in targets] + ['冷p95ms', '失败率', 'Mbps', '状态']
+def gemini_plain(check):
+    """Short, non-technical Gemini verdict for the ranking table."""
+    if not check:
+        return '-'
+    if check.get('reason'):
+        return '待核实'
+    text = GEMINI_PLAIN.get(check['status'], check['status'])
+    if check['status'] == '不可用' and check.get('country') == 'CHN':
+        text += '(被认作中国IP)'
+    return text
+
+
+def plain_reasons(reasons, targets):
+    failed = [reason[:-3] for reason in reasons if reason.endswith('全失败')]
+    if failed and len(failed) == len(targets):
+        return '全部请求失败'
+    parts = (['失败太多'] if '失败率>20%' in reasons else []) + [name + ' 打不开' for name in failed]
+    return '、'.join(parts)
+
+
+def mbps_text(value):
+    # Below 10, one decimal keeps 9.6 from printing as a threshold-meeting 10.
+    if value is None or not math.isfinite(value):
+        return '-'
+    return '%.1f' % value if value < 10 else '%.0f' % value
+
+
+def render(table):
+    sizes = [max(width(row[i]) for row in table) for i in range(len(table[0]))]
+    return ['  '.join(pad(value, sizes[i]) for i, value in enumerate(row)).rstrip() for row in table]
+
+
+def detail_table(ranked, targets, quick):
+    headings = ['节点', '类型', '地区', 'Gemini'] + [target + '冷/复用ms' for target in targets] + ['冷p95ms', '失败率', 'Mbps', '状态']
     table = [headings]
     for item in ranked:
-        table.append([display_name(item['node']), item['type'], item['region']] +
-                     ([gemini_label(item.get('gemini'))] if show_gemini else []) +
+        table.append([display_name(item['node']), item['type'], item['region'], gemini_label(item.get('gemini'))] +
                      [number(item['medians'][(target, 'cold')]) + '/' + number(item['medians'][(target, 'warm')]) for target in targets] +
                      [number(item['p95']), '%.1f%%' % (item['failure_rate'] * 100), number(item['mbps']),
                       '淘汰：' + '、'.join(item['reasons']) if item['reasons'] else ('延迟合格' if quick else '带宽达标' if item['qualified'] else '带宽未达标/未可信测得')])
-    sizes = [max(width(row[i]) for row in table) for i in range(len(headings))]
-    lines = ['  '.join(pad(value, sizes[i]) for i, value in enumerate(row)).rstrip() for row in table]
+    return render(table) + [
+        '冷 = 新连接（含代理拨号、节点握手和目标 TLS）；复用 = 同一连接的第二次请求。QUIC 节点（TUIC/Hysteria2）会话可能被复用，冷值偏乐观。',
+        '收到任何 HTTP 响应（含 403/429）即算延迟成功；p95 为所有目标成功冷请求的最近秩分位数。',
+        '带宽：8 MiB 初筛、前 3 名 32 MiB 深测（有深测用深测）；超时用已收到字节估算，少于 256 KiB 不可信。']
+
+
+def make_summary(ranked, targets, skipped, before, after, quick, minimum,
+                 changed_names=None, detail=False, selected=None):
+    """`selected` maps group -> ranked node name for groups whose current choice is a tested
+    node, resolved by original identity; without it, display names are matched."""
+    show_gemini = any(item.get('gemini') for item in ranked)
+    status = lambda item: (item.get('gemini') or {}).get('status')
+    names = lambda items: '、'.join(display_name(item['node']) for item in items)
     eligible = [item for item in ranked if not item['reasons']]
     recommended = eligible if quick else [item for item in eligible if item['qualified']]
-    no_gemini = lambda item: show_gemini and (item.get('gemini') or {}).get('status') == '不可用'
-    lines += ['', '建议长期固定（本次候选）：' + ('、'.join(display_name(item['node']) + ('（Gemini 不可用）' if no_gemini(item) else '')
-                                                    for item in recommended[:3]) or '无；本次没有满足延迟及带宽门槛的节点')]
-    if show_gemini:
-        usable = [item for item in recommended if (item.get('gemini') or {}).get('status') == '可用']
-        lines.append('兼顾 Gemini 的候选：' + ('、'.join(display_name(item['node']) for item in usable[:3]) or '无'))
-        lines.append(('延迟合格' if quick else '带宽达标') + '但 Gemini 不可用：' +
-                     ('、'.join(display_name(item['node']) for item in recommended if no_gemini(item)) or '无'))
-    if quick:
-        lines.append('quick 模式只按延迟推荐，带宽未验证。')
+    place = {item['node']: index for index, item in enumerate(eligible, 1)}
+
+    def brief(item):
+        parts = ([] if quick else [mbps_text(item['mbps']) + ' Mbps']) + ['延迟 ' + number(item['mean']) + ' ms']
+        if show_gemini:
+            parts.append('Gemini ' + gemini_plain(item.get('gemini')))
+        return display_name(item['node']) + '（' + '，'.join(parts) + '）'
+
+    speed = '延迟合格' if quick else '带宽达标'
+    lines = ['【结论】']
+    if recommended:
+        lines.append('最推荐：' + brief(recommended[0]))
+        if len(recommended) > 1:
+            lines.append('备选：' + names(recommended[1:3]))
     else:
-        lines.append('带宽门槛：%g Mbps；有深测（32 MiB）用深测速度，否则用初筛（8 MiB）。' % minimum)
-    best = {}
-    for item in eligible:
-        best.setdefault(item['region'], item)
-    lines.append('各地区最佳：' + ('；'.join(region + '=' + display_name(item['node']) for region, item in best.items()) or '无'))
-    lines.append('跳过子组/DIRECT/REJECT/未知成员：' + ('、'.join(skipped) or '无'))
+        lines.append('最推荐：无；本次没有' + ('延迟合格的节点' if quick else '带宽达到 %g Mbps 的节点' % minimum))
+    if show_gemini:
+        usable = [item for item in recommended if status(item) == '可用']
+        fallback = [item for item in eligible if status(item) == '可用' and item not in recommended]
+        if usable:
+            first = '就用 ' + display_name(usable[0]['node']) if usable[0] is recommended[0] else brief(usable[0])
+            lines.append('要用 Gemini：' + first + ('；备选 ' + names(usable[1:3]) if len(usable) > 1 else ''))
+        elif fallback:
+            unmeasured = all(item['mbps'] is None for item in fallback[:3])
+            lines.append('要用 Gemini：没有%s且能用的节点；退而求其次 %s（%s）' % (
+                speed, names(fallback[:3]), '带宽没测准' if unmeasured else '带宽不足或没测准'))
+        elif any(status(item) == '可用' for item in ranked):
+            lines.append('要用 Gemini：能用 Gemini 的节点本次都被淘汰了')
+        elif not any(status(item) == '不可用' for item in ranked):
+            lines.append('要用 Gemini：本次没测出哪个节点能用 Gemini（见表中“未知/待核实”）')
+        else:
+            lines.append('要用 Gemini：本次没有确认能用 Gemini 的节点')
+        blocked = [item for item in recommended if status(item) == '不可用']
+        if blocked:
+            lines.append(speed + '但用不了 Gemini：' + names(blocked))
+        pending = [item for item in recommended if (item.get('gemini') or {}).get('reason')]
+        if pending:
+            lines.append('Gemini 待核实（欧洲/英国节点，请在浏览器里试）：' + names(pending))
+    tested = {item['node'] for item in ranked}
+    snapshot = after if after is not None else before
+    if selected is None:
+        selected = {group: now for group, now in snapshot.items() if now in tested}
+    current = sorted(selected.items())
+    if current:
+        lines.append(('FlClash 现在选的：' if after is not None else 'FlClash 测试前选的：') + '；'.join(
+            '%s → %s（%s）' % (group, display_name(now), '第 %d 名' % place[now] if now in place else '已淘汰')
+            for group, now in current))
+
+    lines += ['', '【总排名】' + ('quick 模式未测带宽，按延迟从低到高排' if quick else
+                                 '先看带宽是否达到 %g Mbps，达标的排前面，同档按延迟从低到高' % minimum)]
+    headings = ['排名', '节点', '协议', '地区'] + ([] if quick else ['带宽Mbps']) + ['延迟ms', '失败率'] + (['Gemini'] if show_gemini else [])
+    eliminated = [item for item in ranked if item['reasons']]
+    table = [headings + (['备注'] if eliminated else [])]
+    for item in ranked:
+        rank = '淘汰' if item['reasons'] else str(place[item['node']])
+        bw = [] if quick else ['-' if item['reasons'] else mbps_text(item['mbps']) + ('' if item['qualified'] else ' ↓')]
+        table.append([rank, display_name(item['node']), TYPE_NAMES.get(item['type'].lower(), item['type']), item['region']] +
+                     bw + [number(item['mean']), '%.0f%%' % (item['failure_rate'] * 100) if item['failure_rate'] else '0'] +
+                     ([gemini_plain(item.get('gemini'))] if show_gemini else []) +
+                     ([plain_reasons(item['reasons'], targets)] if eliminated else []))
+    lines += render(table)
+
+    lines += ['', '【怎么看】']
+    if not quick:
+        lines.append('· 带宽：下载速度，越高越好；带 ↓ 的没达到 %g Mbps（或没测准）。只测一次，不同时段会有波动。' % minimum)
+    lines += ['· 延迟：打开一个新网页要等多久（%s 的平均），越低越好，1000 ms 以内算快。' % '、'.join(targets),
+              '· 失败率：请求失败的比例；超过 20% 或某个网站完全打不开就淘汰。']
+    if show_gemini:
+        lines.append('· Gemini：按节点出口 IP 匿名检测；“被认作中国IP”是 Google 把这个出口定位到了中国，其他“不能用”是 Google 限制了这个 IP；'
+                     '“待核实”是欧洲/英国节点要先同意 cookie，没法匿名判断。是否能用不影响排名。')
+    lines.append('· 结果只代表这一次，换个时段再测更稳。要长期固定，在 FlClash 里手动选择的组（Selector）中直接选具体节点；自动测速组会自己换。')
+    if skipped:
+        lines.append('· 未测（子组或非节点成员）：' + '、'.join(skipped))
     if after is None:
-        lines.append('FlClash 策略组：结束快照读取失败，无法核对变化；本工具对其仅发送 GET。')
+        lines.append('· FlClash：结束时没读到它的状态，无法核对；本工具对它只读不写。')
     else:
         changed = changed_names if changed_names is not None else [name for name in sorted(set(before) | set(after)) if before.get(name) != after.get(name)]
-        lines.append('FlClash 策略组：' + ('发生变化：' + '、'.join(changed) + '。URLTest 等组可能自主切换；本工具未切换客户端。' if changed else '测试前后所有策略组 now 一致；本工具仅发送 GET。'))
-    for name in sorted(set(before) | set(after or {})):
-        lines.append('  %s：测试前=%s；测试后=%s' % (name, before.get(name, '(不存在)'),
-                     after.get(name, '(不存在)') if after is not None else '(未取得)'))
-    lines += ['冷连接 TTFB 含代理拨号、节点握手和目标 TLS；appconnect 另存 CSV，time_connect 只是连接本地代理。',
-              'tuic/hysteria2 等 QUIC 节点会话可能被内核复用，冷连接不一定包含节点握手。',
-              '复用列是同一 curl 进程的第二次请求；服务器关闭连接时会重连（CSV note 标明）。',
-              '收到任何 HTTP 响应即算延迟成功，包括 403/429；它们不表示目标服务可正常使用。',
-              '失败率含冷/复用全部请求；p95 使用所有目标成功冷请求的最近秩分位数。',
-              '小文件下载偏向起速快的节点；带宽超时允许使用已收到字节，少于 256 KiB 不可信。',
-              '地区优先使用 Cloudflare trace 的 loc（仅保存地区，不保存出口 IP），失败时从节点名推断。',
-              '单次结果不代表长期稳定，建议不同时段复测。UDP 节点失败也可能来自 WSL/防火墙限制。',
-              'URLTest 组的固定选择在节点失联时仍会自动换；要真正钉死，应在上层 Selector 组直接选具体节点。']
-    if show_gemini:
-        lines.append('Gemini 列：匿名请求 gemini.google.com/app（不登录、不带 cookie），读页面里 Google 按出口 IP 给的可用开关；'
-                     '括号内是 Google 判定的国家（ISO3），可与 Cloudflare 地区不同。国家受支持仍不可用，通常是出口 IP 被 Google 限制；'
-                     '“未知”表示请求失败、非 200 或页面改版找不到开关；“需同意页”是欧盟/英国等出口匿名访问先要同意 cookie，'
-                     '开关恒为 false，无法匿名判定，请在浏览器里核实。Gemini 结果不参与淘汰和排序。')
+        lines.append('· FlClash：' + ('测试前后选择不同：' + '、'.join(changed) + '（自动测速组会自己切换；本工具只读不写）'
+                                     if changed else '测试前后所有选择都没变，本工具只读不写。'))
+    lines.append('· 每次请求的明细在 -raw.csv；加 --detail 可看分网站的技术明细。')
+    if detail:
+        lines += ['', '【技术明细】'] + detail_table(ranked, targets, quick)
     return '\n'.join(lines) + '\n'
 
 
@@ -838,6 +927,7 @@ def parser():
     p.add_argument('--target', action='append', metavar='名称=URL', help='重复指定以替换全部默认目标；禁止 Claude/Anthropic 主机')
     p.add_argument('--quick', action='store_true', help='只测延迟，跳过带宽')
     p.add_argument('--no-gemini', action='store_true', help='跳过每节点一次的 Gemini 可用性检测')
+    p.add_argument('--detail', action='store_true', help='报告末尾附分网站冷/复用延迟、p95 等技术明细')
     p.add_argument('--limit-rate', help='带宽测试 curl 限速，例如 2M')
     p.add_argument('--min-mbps', type=float, default=10, help='推荐带宽门槛（默认 10 Mbps）')
     p.add_argument('--config', type=Path, help='Clash 内联 proxies 配置；默认自动寻找 FlClash 配置')
@@ -994,6 +1084,9 @@ def run(args):
         # Apply display redaction exactly once; short secrets need not be idempotent.
         for key in ('target', 'node_type', 'note'):
             row[key] = public(row[key])
+    snapshot_name = lambda value: mapping.get(value) or public_name(value)
+    # Match current choices to tested nodes by original name: redacted names can collide.
+    selected = {public(k): mapping[v] for k, v in (after if after is not None else before).items() if v in mapping}
     clean_targets = [public(name) for name in target_names]
     if len(set(clean_targets)) != len(clean_targets):
         raise UserError('目标名称脱敏后重复；请使用不包含地址或凭据的唯一名称。')
@@ -1003,13 +1096,14 @@ def run(args):
                          {mapping[name]: check for name, check in gemini.items()} if gemini is not None else None)
     summary = make_summary(ranking, clean_targets, [public_name(name) for name in skipped],
                            # Snapshot keys are always group names (selections() keeps groups only).
-                           {public(k): public_name(v) for k, v in before.items()},
-                           {public(k): public_name(v) for k, v in after.items()} if after is not None else None,
+                           {public(k): snapshot_name(v) for k, v in before.items()},
+                           {public(k): snapshot_name(v) for k, v in after.items()} if after is not None else None,
                            args.quick, args.min_mbps,
                            [public(name) for name in sorted(set(before) | set(after))
-                            if before.get(name) != after.get(name)] if after is not None else None)
+                            if before.get(name) != after.get(name)] if after is not None else None,
+                           args.detail, selected)
     host, label, group = public(socket.gethostname()), public(args.label), public(args.group)
-    summary = '主机：%s  标签：%s  策略组：%s\n' % (host, label or '-', group) + summary
+    summary = 'nodetest 结果 · 主机 %s · 地点 %s · 测试组 %s（%d 个节点）\n\n' % (host, label or '-', group, len(nodes)) + summary
     print(summary)
     paths = write_results(args.out, host, label, group, rows, summary)
     print('已保存：' + '、'.join(path.name for path in paths))

@@ -86,8 +86,13 @@ Other architectures require `--mihomo`. No system proxy settings are modified.
 
 ## Reading results
 
-The terminal and `summary.txt` show cold/reused request median TTFB per target,
-cold-request p95, failure rate, bandwidth, elimination reasons and recommendations.
+The terminal and `summary.txt` have three parts: a conclusion (best node,
+alternatives, the best choice for Gemini, fast nodes that cannot use Gemini, and
+where the client's currently selected nodes rank), one overall ranking table
+(protocol, region, bandwidth, latency = mean of per-target cold TTFB medians,
+failure rate, Gemini), and short plain-language notes. Bandwidth below the
+threshold is marked `↓`. `--detail` appends the technical table: cold/reused
+median TTFB per target, cold p95, raw Gemini verdicts and measurement notes.
 `raw.csv` uses UTF-8 with BOM and includes per-request HTTP status, appconnect,
 TTFB, total duration, bytes, speed and failure/reconnection notes.
 Names are filename-sanitized; repeated runs in the same minute get a suffix.
@@ -110,15 +115,16 @@ codes remain unchanged.
 Each node also gets one anonymous Gemini availability check: a GET of
 `https://gemini.google.com/app` (no cookies, no redirects, compressed, capped
 at 4 MiB) reads the per-IP availability flag and Google's country guess (ISO
-alpha-3) from the page. The `Gemini` column shows 可用 / 不可用 / 未知 with that
-country, e.g. `不可用(SGP)`. A supported country marked unavailable usually means
+alpha-3) from the page. The ranking shows 能用 / 不能用 / 待核实 / 未知
+(`不能用(被认作中国IP)` when Google places the exit in China); `--detail` and the
+CSV keep the raw verdict with the country, e.g. `不可用(SGP)`. A supported country marked unavailable usually means
 Google restricts that exit IP; `CHN` means Google geolocates the exit to China.
 未知 (request failed, non-200, or the flag is missing after a page redesign) is
 retried in later rounds. EEA/UK exits get a cookie-consent gate whose flag is
-always false for anonymous visitors; these show `未知(…·需同意页)` and are not
-retried. Gemini results do not
-eliminate or reorder nodes; the summary instead lists recommended nodes that
-also support Gemini, and nodes that pass the speed bar but cannot use Gemini.
+always false for anonymous visitors; these show 待核实 (raw `未知(…·需同意页)`)
+and are not retried. Gemini results do not
+eliminate or reorder nodes; the conclusion instead names the best node that
+also supports Gemini, and nodes that pass the speed bar but cannot use Gemini.
 `--no-gemini` skips the check. The flag is an undocumented page detail and may
 change; verify 未知 results in a browser. The CSV stores one `phase=gemini`,
 `kind=check` row per node with the verdict in `note`.
@@ -135,8 +141,8 @@ mean of target cold TTFB medians, then pooled cold TTFB p95 (nearest rank).
 The deep-test speed (32 MiB) determines qualification when available, otherwise
 the screening speed (8 MiB).
 Quick mode ranks on latency only. With no bandwidth-qualified candidate,
-normal mode reports no fixed-node recommendation. Regional winners use the
-same ranking among latency-eligible nodes; inspect their bandwidth status.
+normal mode reports no fixed-node recommendation; if no qualified node supports
+Gemini, latency-eligible Gemini nodes are offered as a fallback.
 
 A single run cannot establish long-term stability. Repeat at different times.
 URLTest may switch when a fixed node fails; to pin a node, select that concrete
